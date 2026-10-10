@@ -13,7 +13,7 @@ from brightify import fast_computation as fc
 
 
 #%% Define particle types with their corresponding PDG codes
-PARTICLE = {
+PDG_CODES = {
     'proton': 2212,  # Proton PDG code
     'neutron': 2112,  # Neutron PDG code
     'photon': 22,  # Photon PDG code
@@ -22,14 +22,22 @@ PARTICLE = {
 
 #%% List of column names for different types of data (position, velocity, etc.)
 # These will be used to organize and access particle data
-pos = ['x', 'y', 'z']  # Position components (x, y, z)
-vel = ['Vx', 'Vy', 'Vz']  # Velocity components (Vx, Vy, Vz)
-direction = ['dirX', 'dirY', 'dirZ']  # Direction components (cosines in 3D space)
-image_dir = ['imX', 'imY', 'imZ']  # Image plane direction components
-pos_w = ['Xw', 'Yw', 'Zw']  # Weighted position components
-vel_w = ['Vxw', 'Vyw', 'Vzw']  # Weighted velocity components
-pos_m = ['Xm', 'Ym', 'Zm']  # Mean position components
-vel_m = ['Vxm', 'Vym', 'Vzm']  # Mean velocity components
+PDG_CODE_NAME = 'Kf'
+ENERGY_NAME = 'e'
+WEIGHT_NAME = 'Wt'
+POSITION_NAME_X, POSITION_NAME_Y, POSITION_NAME_Z = 'x', 'y', 'z'
+POSITION_NAMES_XYZ = [POSITION_NAME_X, POSITION_NAME_Y, POSITION_NAME_Z] # Position components (x, y, z)
+VELOCITY_NAME_X, VELOCITY_NAME_Y, VELOCITY_NAME_Z = 'Vx', 'Vy', 'Vz'
+VELOCITY_NAMES_XYZ = [VELOCITY_NAME_X, VELOCITY_NAME_Y, VELOCITY_NAME_Z] # Velocity components (Vx, Vy, Vz)
+
+# POSITION_NAMES = POSITION_NAMES_XYZ  # Position components (x, y, z)
+# VELOCITY_NAMES = VELOCITY_NAMES_XYZ  # Velocity components (Vx, Vy, Vz)
+# DIRECTION_NAMES = ['dirX', 'dirY', 'dirZ']  # Direction components (cosines in 3D space)
+# IMAGE_DIRECTION_NAMES = ['imX', 'imY', 'imZ']  # Image plane direction components
+# WEIGHTED_POSITION_NAMES = ['Xw', 'Yw', 'Zw']  # Weighted position components
+# WEIGHTED_VELOCITY_NAMES = ['Vxw', 'Vyw', 'Vzw']  # Weighted velocity components
+# MEAN_POSITION_NAMES = ['Xm', 'Ym', 'Zm']  # Mean position components
+# MEAN_VELOCITY_NAMES = ['Vxm', 'Vym', 'Vzm']  # Mean velocity components
 
 #%%
 class BrightifyModel:
@@ -129,15 +137,15 @@ class BrightifyModel:
         datas = []
         for p in myfile.particle_blocks:
             datas.append(pd.DataFrame({
-                'Kf': p.pdgcode,  # Particle PDG code
-                'x': p.x,  # x-position
-                'y': p.y,  # y-position
-                'z': p.z,  # z-position
-                'Vx': p.ux,  # Velocity in x-direction
-                'Vy': p.uy,  # Velocity in y-direction
-                'Vz': p.uz,  # Velocity in z-direction
-                'e': p.ekin,  # Kinetic energy
-                'Wt': p.weight  # Weight of the particle
+                PDG_CODE_NAME: p.pdgcode,  # Particle PDG code
+                POSITION_NAME_X: p.x,  # x-position
+                POSITION_NAME_Y: p.y,  # y-position
+                POSITION_NAME_Z: p.z,  # z-position
+                VELOCITY_NAME_X: p.ux,  # Velocity in x-direction
+                VELOCITY_NAME_Y: p.uy,  # Velocity in y-direction
+                VELOCITY_NAME_Z: p.uz,  # Velocity in z-direction
+                ENERGY_NAME: p.ekin,  # Kinetic energy
+                WEIGHT_NAME: p.weight  # Weight of the particle
             }))
             data = pd.concat(datas, ignore_index=True)
         return data
@@ -149,7 +157,8 @@ class BrightifyModel:
     #         data = f.read().replace('D', 'E')
     #     data = pd.read_csv(
     #         StringIO(data), header=None, delim_whitespace=True, 
-    #         names=('Kf', 'x', 'y', 'z', 'Vx', 'Vy', 'Vz', 'e', 'Wt',
+    #         names=(PDG_CODE_NAME, POSITION_NAME_X, POSITION_NAME_Y, POSITION_NAME_Z,
+    #                VELOCITY_NAME_X, VELOCITY_NAME_Y, VELOCITY_NAME_Z, ENERGY_NAME, WEIGHT_NAME,
     #                'time', 'c1', 'c2', 'c3', 'name', 'nocas', 'nobch', 'no'
     #                )
     #         )
@@ -162,7 +171,7 @@ class BrightifyModel:
         Returns the data that matches the current filter conditions.
         """
         return self.data[self.filter]
-    
+
     
     @property
     def brightness(self):
@@ -192,7 +201,7 @@ class BrightifyModel:
     
         # Compute sigma using precomputed values
         return np.sqrt(
-            np.abs(fc.sum_f(slice_filt_i['Wt']**2) / Wt_sq_sum - Am * window_weight) /
+            np.abs(fc.sum_f(slice_filt_i[WEIGHT_NAME]**2) / Wt_sq_sum - Am * window_weight) /
             (window_weight - 1)
         )
     
@@ -202,7 +211,7 @@ class BrightifyModel:
         Resets the filter so that no data is excluded by default.
         """
         self.filter = self.data.index >= 0
-    
+
     
     def apply_filter(self, particle=None, energy=None, x=None, y=None):
         """
@@ -215,27 +224,27 @@ class BrightifyModel:
         # If a particle type is specified, filter by the particle's PDG code
         if particle:
             self.particle = particle
-            self.filter &= (self.data['Kf'] == PARTICLE[particle])
+            self.filter &= (self.data[PDG_CODE_NAME] == PDG_CODES[particle])
         
         # If an energy range is specified, filter particles within that range
         if energy:
             self.energy = (min(energy), max(energy))
-            self.filter &= (self.data['e'] >= self.energy[0])
-            self.filter &= (self.data['e'] <= self.energy[1])
+            self.filter &= (self.data[ENERGY_NAME] >= self.energy[0])
+            self.filter &= (self.data[ENERGY_NAME] <= self.energy[1])
             
         # If an x-position range is specified, filter particles within that range
         if x:
             self.xf = (min(x), max(x))
-            self.filter &= (self.data['x'] >= self.xf[0])
-            self.filter &= (self.data['x'] <= self.xf[1])
+            self.filter &= (self.data[POSITION_NAME_X] >= self.xf[0])
+            self.filter &= (self.data[POSITION_NAME_X] <= self.xf[1])
             
         # If a y-position range is specified, filter particles within that range
         if y:
             self.yf = (min(y), max(y))
-            self.filter &= (self.data['y'] >= self.yf[0])
-            self.filter &= (self.data['y'] <= self.yf[1])
+            self.filter &= (self.data[POSITION_NAME_Y] >= self.yf[0])
+            self.filter &= (self.data[POSITION_NAME_Y] <= self.yf[1])
+
             
-    
     def calculate_properties(self, data_filt, shape1D, shape2D, 
                              slice_filter_func, points, forced_direction=None):
         """
@@ -246,8 +255,8 @@ class BrightifyModel:
         forced_direction : np.ndarray or None
             If provided, use this direction for all slices instead of computing mean.
         """
-        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)
-        Am = np.mean(self.data['Wt']**2)
+        Wt_sq_sum = fc.sum_f(self.data[WEIGHT_NAME]**2)
+        Am = np.mean(self.data[WEIGHT_NAME]**2)
     
         self.total_neutrons = np.full(shape1D, np.nan)
         self.total_weights = np.full(shape1D, np.nan)
@@ -272,13 +281,13 @@ class BrightifyModel:
             if forced_direction is not None:
                 direction_vec = forced_direction
             else:
-                direction_vec = fc.direction_f(fc.mean_f(slice_i[vel], slice_i.Wt))
+                direction_vec = fc.direction_f(fc.mean_f(slice_i[VELOCITY_NAMES_XYZ], slice_i.Wt))
     
             self.mean_directions[i] = direction_vec
             self.mean_directions_spher[i] = fc.cart2spher(*direction_vec)
     
             # Apply angular filter
-            slice_filt_i = slice_i[fc.cos_f(slice_i[vel], direction_vec) >= self.dir_window]
+            slice_filt_i = slice_i[fc.cos_f(slice_i[VELOCITY_NAMES_XYZ], direction_vec) >= self.dir_window]
             self.window_weights[i] = fc.sum_f(slice_filt_i.Wt)
     
             # Sigma and relative error
@@ -287,8 +296,8 @@ class BrightifyModel:
     
             # Weighted direction
             self.mean_directions_window[i] = direction_vec * self.window_weights[i]
-        
-        
+
+
     def calculate_properties_adaptive(self, data_filt, shape1D, shape2D, 
                                   slice_filter_func, points, bins_cart=35, threshold_frac=0.98):
         """
@@ -303,8 +312,8 @@ class BrightifyModel:
             Fraction of the global histogram maximum to define maxima voxels.
         """
         # Calculate mean squared weight (Am) and sum of squared weights (Wt_sq_sum)
-        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)  # Global sum of squared weights
-        Am = np.mean(self.data['Wt']**2)  # Mean squared weight
+        Wt_sq_sum = fc.sum_f(self.data[WEIGHT_NAME]**2)  # Global sum of squared weights
+        Am = np.mean(self.data[WEIGHT_NAME]**2)  # Mean squared weight
     
         # Initialize arrays
         self.total_neutrons = np.full(shape1D, np.nan)
@@ -334,14 +343,14 @@ class BrightifyModel:
             self.total_mean[i] = np.mean(slice_i.Wt)
     
             # Mean direction of slice
-            self.mean_directions[i] = fc.direction_f(fc.mean_f(slice_i[vel], slice_i.Wt))         
+            self.mean_directions[i] = fc.direction_f(fc.mean_f(slice_i[VELOCITY_NAMES_XYZ], slice_i.Wt))         
             self.mean_directions_spher[i] = fc.cart2spher(*self.mean_directions[i])
     
             # ------------------ Cartesian histogram ------------------
-            hist, edges = np.histogramdd(slice_i[vel].to_numpy(),
+            hist, edges = np.histogramdd(slice_i[VELOCITY_NAMES_XYZ].to_numpy(),
                                          bins=[bins_cart]*3,
                                          range=[[-1,1],[-1,1],[-1,1]],
-                                         weights=slice_i['Wt'])
+                                         weights=slice_i[WEIGHT_NAME])
             self.hist[i] = hist
             self.hist_edges[i] = edges
     
@@ -370,7 +379,7 @@ class BrightifyModel:
             self.adaptive_dir_spher[i] = fc.cart2spher(*adaptive_dir_vec)
     
             # Filter directions within angular window
-            cos_filter = fc.cos_f(slice_i[vel], self.adaptive_dir[i])
+            cos_filter = fc.cos_f(slice_i[VELOCITY_NAMES_XYZ], self.adaptive_dir[i])
             slice_filt_i = slice_i[cos_filter >= self.dir_window]
             self.window_weights[i] = fc.sum_f(slice_filt_i.Wt)
     
@@ -385,10 +394,11 @@ class Spherical(BrightifyModel):
     def __init__(self, inputFile=None, outputFile=None, primary_protons=None, 
                  pCurrent=None, pos_size=None, dir_size=None, radius=None,
                  spiral_points=None):
+
         """
         Initialize the Spherical model, which is a subclass of BrightifyModel.
         
-        Parameters
+        Parameters:
         ----------
         inputFile: str
             Path to the input file containing particle data.
@@ -442,8 +452,8 @@ class Spherical(BrightifyModel):
         Filtering function specific to the Spherical subclass. 
         It filters `slice_i` based on the cosine of the angle between `vec` and `data_filt`.
         """
-        return data_filt[fc.cos_f(data_filt[pos], vec) > self.pos_window]
-    
+        return data_filt[fc.cos_f(data_filt[POSITION_NAMES_XYZ], vec) > self.pos_window]
+
 
     def calculate(self):
         data_filt = self.data_filter
@@ -478,8 +488,8 @@ class Spherical(BrightifyModel):
         
         # Convert the spherical coordinates (theta, phi) to Cartesian coordinates
         return fc.spher2cart(1, spiral_theta, spiral_phi)
-    
 
+    
     def plot(self):
         """
         Plots a 3D brightness map of the spherical shell.
@@ -619,10 +629,10 @@ class Flat(BrightifyModel):
 
     #------------------ Filter function ---------------------------#
     def flat_filter_func(self, data_filt, vec):
-        return data_filt[(data_filt['x'] >= vec[0] - self.pos_size_x/2) & 
-                         (data_filt['x'] <  vec[0] + self.pos_size_x/2) & 
-                         (data_filt['y'] >= vec[1] - self.pos_size_y/2) & 
-                         (data_filt['y'] <  vec[1] + self.pos_size_y/2)]
+        return data_filt[(data_filt[POSITION_NAME_X] >= vec[0] - self.pos_size_x/2) & 
+                         (data_filt[POSITION_NAME_X] <  vec[0] + self.pos_size_x/2) & 
+                         (data_filt[POSITION_NAME_Y] >= vec[1] - self.pos_size_y/2) & 
+                         (data_filt[POSITION_NAME_Y] <  vec[1] + self.pos_size_y/2)]
 
     #------------------ Unified calculation -----------------------#
     def calculate(self, method="adaptive", bins_cart=35, threshold_frac=0.98):
@@ -851,7 +861,9 @@ class Flat(BrightifyModel):
         cbar.ax.tick_params(labelsize=18)
         cbar.ax.set_ylabel('relative error', fontsize=18)
         plt.show()
-     
+
+
+
     def surface_crossing(self, v_x, v_y, v_z, theta_D):
         """
         Method to calculate neutron surface crossing for PHITS comparison
@@ -860,12 +872,12 @@ class Flat(BrightifyModel):
         """
         data_filt = self.data_filter
         dir_D = np.array([v_x, v_y, v_z])
-        slice_filt_i = data_filt[fc.cosRR_f(data_filt[vel], dir_D) >= np.cos(theta_D)]
+        slice_filt_i = data_filt[fc.cosRR_f(data_filt[VELOCITY_NAMES_XYZ], dir_D) >= np.cos(theta_D)]
         self.window_weights = fc.sum_f(slice_filt_i.Wt)
         
         # Compute statistical uncertainty
-        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)  # Global sum of squared weights
-        Am = np.mean(self.data['Wt']**2)  # Mean squared weight
+        Wt_sq_sum = fc.sum_f(self.data[WEIGHT_NAME]**2)  # Global sum of squared weights
+        Am = np.mean(self.data[WEIGHT_NAME]**2)  # Mean squared weight
         self.sigma = self.compute_sigma(slice_filt_i, Wt_sq_sum, Am, self.window_weights)
     
             # Calculate relative error
@@ -891,18 +903,18 @@ class Flat(BrightifyModel):
         self.x_min, self.x_max = data_filt.x.min(), data_filt.x.max()
         self.y_min, self.y_max = data_filt.y.min(), data_filt.y.max()
         
-        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)  # Global sum of squared weights
-        Am = np.mean(self.data['Wt']**2)  # Mean squared weight
+        Wt_sq_sum = fc.sum_f(self.data[WEIGHT_NAME]**2)  # Global sum of squared weights
+        Am = np.mean(self.data[WEIGHT_NAME]**2)  # Mean squared weight
         
         slice_i = data_filt
         self.total_neutrons = len(slice_i)
         self.total_weights = fc.sum_f(slice_i.Wt)
         self.total_mean = np.mean(slice_i.Wt)
         
-        self.mean_directions = fc.direction_f(fc.mean_f(slice_i[vel], slice_i.Wt))
+        self.mean_directions = fc.direction_f(fc.mean_f(slice_i[VELOCITY_NAMES_XYZ], slice_i.Wt))
         
         slice_filt_i = slice_i[
-            fc.cos_f(slice_i[vel], self.mean_directions) >= self.dir_window
+            fc.cos_f(slice_i[VELOCITY_NAMES_XYZ], self.mean_directions) >= self.dir_window
             ]
         self.window_weights = fc.sum_f(slice_filt_i.Wt)
         
