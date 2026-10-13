@@ -117,7 +117,7 @@ class BrightifyModel:
 
 
     @property
-    def data_filter(self):
+    def data_filtered(self):
         """
         Property method to return filtered data based on the current filter
         Returns the data that matches the current filter conditions.
@@ -393,7 +393,7 @@ class Spherical(BrightifyModel):
 
 
     def calculate(self):
-        data_filt = self.data_filter
+        data_filt = self.data_filtered
         self.pos_window = 1 - self.pos_size / (2 * np.pi * self.radius**2)  # Position window
         self.dir_window = 1 - self.dir_size / (2 * np.pi)  # Direction window (d(omega) = dS/r^2)
     
@@ -535,7 +535,7 @@ class Flat(BrightifyModel):
         
         method: "mean", "adaptive", or "normal"
         """
-        data_filt = self.data_filter
+        data_filt = self.data_filtered
         self.dir_window = 1 - self.dir_size / (2 * np.pi)
         self.prepare_vectors()
 
@@ -745,7 +745,7 @@ class Flat(BrightifyModel):
         w.r.t a given direction
         
         """
-        data_filt = self.data_filter
+        data_filt = self.data_filtered
         dir_D = np.array([v_x, v_y, v_z])
         slice_filt_i = data_filt[fc.cosRR_f(data_filt[VELOCITY_NAMES_XYZ], dir_D) >= np.cos(theta_D)]
         self.window_weights = fc.sum_f(slice_filt_i[WEIGHT_NAME])
@@ -767,7 +767,7 @@ class Flat(BrightifyModel):
         w.r.t mean direction
         
         """
-        data_filt = self.data_filter
+        data_filt = self.data_filtered
         
         # d(omega) = dS/r^2 = 3*6*1e-4/10^2 = 0.18
         self.dir_window = 1 - self.dir_size / (2 * np.pi)
