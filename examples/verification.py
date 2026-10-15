@@ -52,6 +52,21 @@ read_data = bfy.read_data
 load_model = bfy.load_model
 
 #%%
+chunk_gen = read_data(path, return_generator=True)
+print(chunk_gen)
+print(chunk_gen.gi_running, chunk_gen.gi_code, chunk_gen.gi_frame)
+print(next(chunk_gen))
+#%%
+i=1
+for chunk in chunk_gen:
+    print(i)
+    i += 1
+chunk.tail()
+
+#%%
+entire_data = read_data(path)
+entire_data.tail()
+#%%
 # construct a Flat object, reading in data on the way:
 flatModel = Flat(
     inputFile=path, 
