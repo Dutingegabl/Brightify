@@ -41,46 +41,83 @@ VELOCITY_NAME_X, VELOCITY_NAME_Y, VELOCITY_NAME_Z = VELOCITY_NAMES_XYZ
 # MEAN_POSITION_NAMES = ['Xm', 'Ym', 'Zm']  # Mean position components
 # MEAN_VELOCITY_NAMES = ['Vxm', 'Vym', 'Vzm']  # Mean velocity components
 
-def read_data(inputFile, input_is_ascii=False):
+def read_data(inputFile, input_is_ascii=False, return_generator=False, chunk_size=100_000):
     """
     Reads data from mcpl / mcpl.gz file and returns it as pandas dataframe.
     Optionally from ascii file.
+    return_generator: Keep False if you want a dataframe with the entire data, set True if you want a generator for data chunks,
+    which reads one chunk after the other from the file.
+    chunk_size: Amount of lines/particles per data chunk (only used if return_generator is True).
     """
     inputFile=Path(inputFile).resolve()
-    data = None
-    if input_is_ascii:
-        with open(str(inputFile), 'r') as f:
-                data = f.read().replace('D', 'E')
-        data = pd.read_csv(
-            StringIO(data), header=None, delim_whitespace=True, 
-            names=(PDG_CODE_NAME, POSITION_NAME_X, POSITION_NAME_Y, POSITION_NAME_Z,
-                VELOCITY_NAME_X, VELOCITY_NAME_Y, VELOCITY_NAME_Z, ENERGY_NAME, WEIGHT_NAME,
-                'time', 'c1', 'c2', 'c3', 'name', 'nocas', 'nobch', 'no')
-            )
-    elif inputFile.name.endswith(".mcpl") or inputFile.name.endswith(".mcpl.gz"):
-        # Read the MCPL file (format used for Brightify input files)
-        myfile=mcpl.MCPLFile(str(inputFile),blocklength=1e13) # the blocklength is so high, it will almost always load the entire file
-        # Loop through each particle block in the MCPL file and store data
-        # in a list of pandas DataFrames, and then combine all into one dataframe.
-        data_frames = []
-        for p in myfile.particle_blocks: # since we have a loop over the blocks, shouldn't each block's data be appended to self.data, instead of overwriting it each time?
-            df = pd.DataFrame({
-                PDG_CODE_NAME: p.pdgcode,  # Particle PDG code
-                ENERGY_NAME: p.ekin,  # Kinetic energy
-                WEIGHT_NAME: p.weight,  # Weight of the particle
-                POSITION_NAME_X: p.x,  # x-position
-                POSITION_NAME_Y: p.y,  # y-position
-                POSITION_NAME_Z: p.z,  # z-position
-                VELOCITY_NAME_X: p.ux,  # Velocity in x-direction
-                VELOCITY_NAME_Y: p.uy,  # Velocity in y-direction
-                VELOCITY_NAME_Z: p.uz  # Velocity in z-direction
-            })
-            data_frames.append(df)
-        data = pd.concat(data_frames, ignore_index=True)
-    else: raise ValueError("input could not be interpreted") 
-    print("Data has been read from "+str(inputFile))
-    return data  
-
+    def chunk_generator(inputFile=inputFile, input_is_ascii=input_is_ascii, chunk_size=chunk_size):
+        # check chunk_size
+        try:
+            chunk_size = int(chunk_size)
+        except:
+            raise ValueError("chunk_size couldn't be converted to integer")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size can't be non-positive")
+        if chunk_size < 1_000:
+            raise UserWarning("chunk_size is small, overhead can cause program to run slowly")
+        # choose input:
+        if input_is_ascii:
+            try:
+                ascii_chunk_generator = pd.read_csv(
+                    str(inputFile), header=None, delim_whitespace=True, 
+                    names=(
+                        PDG_CODE_NAME, POSITION_NAME_X, POSITION_NAME_Y, POSITION_NAME_Z,
+                        VELOCITY_NAME_X, VELOCITY_NAME_Y, VELOCITY_NAME_Z, ENERGY_NAME, WEIGHT_NAME,
+                        'time', 'c1', 'c2', 'c3', 'name', 'nocas', 'nobch', 'no'
+                    ),
+                    chunksize=chunk_size,
+                    dtype=str, # Read everything as string initially to avoid parsing crashes on 'D'
+                    )
+                for chunk in ascii_chunk_generator:
+                    # 2. Vectorized replacement of 'D' with 'E' across the relevant float columns
+                    float_cols = [
+                        POSITION_NAME_X, POSITION_NAME_Y, POSITION_NAME_Z,
+                        VELOCITY_NAME_X, VELOCITY_NAME_Y, VELOCITY_NAME_Z, 
+                        ENERGY_NAME, WEIGHT_NAME, 'time'
+                    ]
+                    for col in float_cols:
+                        if col in chunk.columns:
+                            # .str.replace is vectorized (runs in C, blazing fast)
+                            chunk[col] = chunk[col].str.replace('D', 'E', regex=False).astype(float)
+                    yield chunk
+            except:
+                raise ValueError("ascii file could not be read")
+        elif inputFile.name.endswith(".mcpl") or inputFile.name.endswith(".mcpl.gz"):
+            try:
+                # Read the MCPL file (format used for Brightify input files)
+                myfile=mcpl.MCPLFile(str(inputFile),blocklength=chunk_size)
+                # Loop through each particle block in the MCPL file
+                for p in myfile.particle_blocks:
+                    chunk = pd.DataFrame({
+                        PDG_CODE_NAME: p.pdgcode,  # Particle PDG code
+                        ENERGY_NAME: p.ekin,  # Kinetic energy
+                        WEIGHT_NAME: p.weight,  # Weight of the particle
+                        POSITION_NAME_X: p.x,  # x-position
+                        POSITION_NAME_Y: p.y,  # y-position
+                        POSITION_NAME_Z: p.z,  # z-position
+                        VELOCITY_NAME_X: p.ux,  # Velocity in x-direction
+                        VELOCITY_NAME_Y: p.uy,  # Velocity in y-direction
+                        VELOCITY_NAME_Z: p.uz  # Velocity in z-direction
+                    })
+                    yield chunk
+            except:
+                raise ValueError("mcpl or mcpl.gz file could not be read")
+        else:
+            raise ValueError("input could not be interpreted") 
+    # return what user prefers:
+    if return_generator:
+        print("Data chunks will be read from "+str(inputFile))
+        return chunk_generator(inputFile=inputFile, input_is_ascii=input_is_ascii, chunk_size=chunk_size)    
+    else:
+        chunks = list(chunk_generator(inputFile=inputFile, input_is_ascii=input_is_ascii, chunk_size=1e7))
+        # here use very large chunk_size since we don't need small chunks anyways if we combine them all
+        print("Data has been read from "+str(inputFile))
+        return pd.concat(chunks, ignore_index=True)
 
 #%%
 class BrightifyModel:
