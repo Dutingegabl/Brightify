@@ -142,7 +142,7 @@ class BrightifyModel:
     # Note that the super class constructor should only contain parameters that all the sub-class constructors have in common.
     
     
-    #  ----- 1. Object creation logic -----
+    # ----- Object creation logic -----
 
     # Classical constructor
     def __init__(self, 
@@ -151,19 +151,23 @@ class BrightifyModel:
                  outputFile=None,
                  primary_protons=None,
                  pCurrent=None,   
-                 dir_size=None
+                 dir_size=None,
+                 parallel=False,
+                 chunk_size=100_000,
                  ): 
         """
         Initializes the BrightifyModel class.
         
         Parameters:
         - inputFile: Path to the input file containing particle data (optional). Default accepted format is .mcpl(.gz).
-        - input_is_ascii: Whether you are using ascii input separated by whitespace instead of .mcpl(.gz) files. 
+        - input_is_ascii: Whether you are using ascii input separated by whitespace instead of .mcpl(.gz) files.
         - outputFile: Optional path to file in which previous BrightifyModel was saved (pickle dump of attributes).
           Note: Please use brightify.load_model(outputFile) instead
         - primary_protons: Number of primary protons (used for brightness calculation). Can be found in standard output file of MC code
         - pCurrent: Source particle current (used for brightness calculation).
         - dir_size: Size of the solid-angle window (in steradians) around the direction used for brightness calculation
+        - parallel: Set to True if you want calculations to be executed in multiple processes in parallel.
+        - chunk_size: Amount of particles per input data chunk distributed to parallel processes.
         """
 
         # --- 0. catch (deprecated) case where user gives a dump file ---
@@ -200,20 +204,29 @@ class BrightifyModel:
         except (ValueError, TypeError): raise ValueError("dir_size must be float-convertible")
         self.dir_size = dir_size
 
-        # --- 2. Data loading ---
+        # parallel
+        try: parallel = bool(parallel)
+        except (ValueError, TypeError): raise ValueError("parallel must be bool-convertible")
+        self.parallel = parallel
 
-        # this needs to be a pandas DataFrame
-        self.data = read_data(inputFile=self.inputFile, input_is_ascii=self.input_is_ascii)
-             
-        # --- 3. Filter initialization ---
-        
-        # Reset filter to include all data initially    
-        self.reset_filter()
+        # chunk_size
+        try: chunk_size = int(chunk_size)
+        except (ValueError, TypeError): raise ValueError("chunk_size must be int-convertible")
+        self.chunk_size = chunk_size
 
-        # --- 4. Initialize calculation method variable (holds most recent applied calculation method string e.g. "adaptive") ---
+        # --- 2. Data loading and filter reset ---
+
+        if not parallel: # get one large dataframe
+            self.reset_data()
+            self.reset_filter()
+        elif parallel: # get a generator of small dataframes
+            self.reset_data_parallel()
+            self.reset_filter_parallel()
+            
+        # --- 3. Initialize calculation method variable (holds most recent applied calculation method string e.g. "adaptive") ---
         self.calculation_method = None
 
-    # Alternative: construct object of model from saved dump
+    # Alternative constructor: loading model from dump file
     @classmethod
     def load_model(cls, dumpFile, enforce_type=False):
         """
@@ -238,15 +251,39 @@ class BrightifyModel:
         model.__dict__.update(attrDict)
         print("Model of type "+modelType.__name__+" was loaded from "+str(dumpFile))
         print("The following attributes were filled with values: "+str(list(attrDict.keys())).strip("[]"))
-        if hasattr(model, "data") and not hasattr(model, "filter"):
-            model.reset_filter()
-        if not hasattr(model, "data"):
-            warn_text = "Your loaded model has no input data. You can insert one with `model.data = brightify.read_data(file)`."
-            if hasattr(model, "filter"): warn_text = warn_text + "\nYour loaded model contains a filter. It is recommended to run `model.reset_filter()`, unless you are sure that the filter matches the data."
-            raise UserWarning(warn_text)                 
+        
+        # check the model's attributes now:
+        # data
+        if not model.parallel:
+            if hasattr(model, "data"):
+                print("The loaded model contains data. But you can (re)set it how you like using reset_data().")
+            else:
+                print("The loaded model contains no data. You may want to run reset_data().")          
+        else:
+            print("The loaded model was using parallel processing and contains no data. See reset_data_parallel().")
+        
+        # filter:
+        if not model.parallel:
+            if hasattr(model, "filter"):
+                print("The loaded model contains a filter. If you want to reset it, use reset_filter().")
+            else:
+                if hasattr(model, "data"):
+                    print("The loaded model contains data but no filter. Please see reset_filter().")
+        else:
+            print("The loaded model was using parallel processing and contains no filter. See reset_filter_parallel().")
+            
+        # rotation
+        if hasattr(model, "rotation"):
+            print("The loaded model contains a rotation of coordinates according to the following rotation matrix: ", str(model.rotation))
+            if hasattr(model, "data"):
+                print("The rotation will now be applied again to the data found in the loaded model.")
+                model.apply_rotation(matrix=model.rotation, replace=True)
+            else:
+                print("To apply a rotation after (re)loading data into the model, use apply_rotation/_parallel(). It is recommended to store model.rotation now for later use.")
+        
         return model
 
-    # ----- 2. Saving and loading logic -----
+    # ----- Saving logic (dump file creation) -----
 
     SAVE_KEYS = ['inputFile',
                  'input_is_ascii',
@@ -254,7 +291,9 @@ class BrightifyModel:
                  'pCurrent',
                  'dir_size',
                  'calculation_method',
-                 'rotation']
+                 'rotation',
+                 'parallel',
+                 'chunk_size']
         # This class variable is read upon calling the saving method on an object whose type is this class.
         # It determines which attributes of the object are saved when the saving method is called on that object.
         # DEFINE THE IDENTICALLY NAMED VARIABLE in the child classes; their lists will be added to this one,
@@ -294,6 +333,9 @@ class BrightifyModel:
         - include_filter = True will include the filter (length = number of particles in input data).
         - include_data = True will include the input data (self.data, which is a pandas dataFrame).
             WARNING: File might get large.
+
+        Note: For parallel mode, filter and data cannot be included. 
+        In any case, data can be loaded into the model again after loading via the method reset_data(_parallel). 
         """
         dumpFile = Path(dumpFile).resolve()
         # Prepare file path
@@ -307,8 +349,9 @@ class BrightifyModel:
         # include/exclude filter:
         if not include_filter and "filter" in attrDict.keys():
             attrDict.pop("filter") 
-        elif include_filter and hasattr(self, "filter"):
-            attrDict["filter"] = getattr(self, "filter")
+        elif include_filter:
+            if hasattr(self, "filter"):
+                attrDict["filter"] = getattr(self, "filter")
         # include/exclude data:
         if not include_data and "data" in attrDict.keys():
             attrDict.pop("data") 
@@ -321,16 +364,85 @@ class BrightifyModel:
         print("A dump file of the model of type "+self.__class__.__name__+" has been saved to "+str(dumpFile)
               +" and the following attributes were included: "+str(list(attrDict.keys())).strip("[]"))
 
-    # ----- 3. Calculations logic -----
+    # ----- Data methods -----
 
-
-    def rotate(self, z_vector=[0,0,1], x_vector=[1,0,0], undo_all=False, apply_self=False):
+    def reset_data(self, inputFile=None, input_is_ascii=None): # includes filter and rotation reset
         """
-        Rotates the coordinate system of self.data such that:
+            (Re)loads data, disables parallel processing, deletes parallel data, resets filter, and resets coordinate rotation.
+        """
+        if inputFile is None:
+            inputFile = self.inputFile
+        else:
+            self.inputFile = Path(inputFile).resolve()
+        if input_is_ascii is None: 
+            input_is_ascii = self.input_is_ascii
+        else:
+            self.input_is_ascii = input_is_ascii
+        self.data = read_data(inputFile=inputFile, input_is_ascii=input_is_ascii)
+        self.parallel=False
+        if hasattr(self, "data_gen"):
+            del self.data_gen
+        self.reset_filter()
+        self.reset_rotation(undo=False)
+
+    def reset_data_parallel(self, inputFile=None, input_is_ascii=None, chunk_size=None): # includes filter and rotation reset
+        """
+            (Re)loads data, enables parallel processing, deletes non-parallel data, resets filter, and resets rotation if applicable.
+        """
+        if inputFile is None:
+            inputFile = self.inputFile
+        else:
+            self.inputFile = Path(inputFile).resolve()
+        if input_is_ascii is None: 
+            input_is_ascii = self.input_is_ascii
+        else:
+            self.input_is_ascii = input_is_ascii
+        if chunk_size is None:
+            chunk_size = self.chunk_size
+        else:
+            self.chunk_size = chunk_size
+        self.data_gen = read_data(inputFile=inputFile, input_is_ascii=input_is_ascii, return_generator=True, chunk_size=chunk_size)
+        self.parallel = True
+        if hasattr(self, "data"):
+            del self.data
+        self.reset_filter_parallel()
+        self.reset_rotation_parallel()
+
+    @property
+    def data_filtered(self):
+        """
+        Property method to return filtered data based on the current filter
+        Returns the data that matches the current filter conditions.
+        """
+        if not hasattr(self, "filter"):
+            self.reset_filter()
+        return self.data[self.filter]
+
+    def data_filtered_parallel(self):
+        """
+        Returns a generator for filtered data chunks
+        """
+        for chunk in self.data_gen:
+            chunk = chunk[
+                chunk[PDG_CODE_NAME].isin([PDG_CODES[name] for name in self.particle_filter_parallel]) &
+                chunk[ENERGY_NAME].between(*self.energy_filter_parallel) &
+                chunk[POSITION_NAME_X].between(*self.x_filter_parallel) &
+                chunk[POSITION_NAME_Y].between(*self.y_filter_parallel) &
+                chunk[POSITION_NAME_Z].between(*self.z_filter_parallel)
+            ]
+            yield chunk
+
+    # ----- Coordinate Rotation methods -----
+    
+    def apply_rotation(self, z_vector=[0,0,1], x_vector=[1,0,0], matrix=None, replace=False): # includes filter reset
+        """
+        Rotates the coordinate system of the model's data such that:
         - z_vector ([x,y,z]): Its direction is the Z-axis in the new data. This is required for 2D models like Flat which need Z to be the normal direction.
         - x_vector ([x,y,z]): Its projection onto the new X-Y-plane is the new X-axis.
-        - undo_all: set True if you want to undo all previously applied rotations. (Overrides all other parameters)
-        - apply_self: set True if you want to apply self.rotation (e.g. after reloading a model from disk and loading in the original data separately). (Overrides the two vector parameters)
+        - matrix: Pass here any 3x3 matrix to be applied to the data instead of the two vector parameters. You should yourself ensure it is a rotation matrix.
+        - replace: If True, the rotation that's saved in the model will be the method input's rotation, instead of the total rotation that results in combination with previously applied rotations.
+
+        ATTENTION: This resets any filter that had been applied. After rotation, spatial data filters you apply need to be written with the new coordinates in mind! 
         """
         # this relies on self.rotation
         # reminder: usually, we calculate v'^T = R * v^T where v^T is a column vector.
@@ -338,21 +450,8 @@ class BrightifyModel:
         # because v' = (v'^T)^T = (R * v^T)^T = (v^T)^T * R^T = v * R^T.
         # that means instead of R * v^T, we write v * R^T to apply R.
         # In order to reverse it, we write v' * R since that is (v * R^T)*R = v * 1 = v.
-        if undo_all:
-            if not hasattr(self, "rotation"):
-                print("nothing to undo")
-                return
-            self.data.loc[:, POSITION_NAMES_XYZ] = self.data[POSITION_NAMES_XYZ].values @ self.rotation
-            self.data.loc[:, VELOCITY_NAMES_XYZ] = self.data[VELOCITY_NAMES_XYZ].values @ self.rotation
-            del self.rotation
-            return
-        elif apply_self:
-            if not hasattr(self, "rotation"):
-                print("self.rotation not found")
-                return
-            self.data.loc[:, POSITION_NAMES_XYZ] = self.data[POSITION_NAMES_XYZ].values @ self.rotation.T
-            self.data.loc[:, VELOCITY_NAMES_XYZ] = self.data[VELOCITY_NAMES_XYZ].values @ self.rotation.T
-            return
+        if matrix:
+            R = matrix
         else:
             # 1. Define the new Z-axis from the normal vector
             z_new = np.array(z_vector, dtype=float)
@@ -371,25 +470,167 @@ class BrightifyModel:
             # 4. Construct the rotation matrix (where each row is one of the new axes)
             R = np.vstack([x_new, y_new, z_new])
             # 5. Apply the TRANSPOSE of the rotation to position and velocity columns
+        if not self.parallel:
             self.data.loc[:, POSITION_NAMES_XYZ] = self.data[POSITION_NAMES_XYZ].values @ R.T
             self.data.loc[:, VELOCITY_NAMES_XYZ] = self.data[VELOCITY_NAMES_XYZ].values @ R.T
-            # store/update rotation
-            if hasattr(self, "rotation"):
-                self.rotation = R @ self.rotation
-            else:
-                self.rotation = R
-        
+            self.reset_filter()
+        else:
+            # No calculations are done at this point on the parallel data, it will be done on demand.
+            self.reset_filter_parallel()
+        print("A coordinate rotation has been applied, and therefore the filter was reset.")
+        # store/update rotation
+        if replace or not hasattr(self, "rotation"):
+            self.rotation = R
+        else:
+            self.rotation = R @ self.rotation
 
-    @property
-    def data_filtered(self):
+    # give another name to it for completeness
+    apply_rotation_parallel = apply_rotation # includes filter reset
+  
+    def reset_rotation(self, undo=True): # includes filter reset
         """
-        Property method to return filtered data based on the current filter
-        Returns the data that matches the current filter conditions.
+            Reset rotation of coordinates. Resets filter too.
+            - undo: Set True if you want to apply the inverse of previous rotation(s) done to the data. 
+            Set to False if you just want to delete the attribute that stores the applied rotations, and do not want to change the data.
+
+            ATTENTION: After rotation-undoing, spatial data filters you apply need to be written with the new coordinates in mind!
         """
+        if not hasattr(self, "rotation"):
+            print("No rotation found to reset.")
+            return
+        if undo:
+            print("Undoing rotation...")
+            self.data.loc[:, POSITION_NAMES_XYZ] = self.data[POSITION_NAMES_XYZ].values @ self.rotation
+            self.data.loc[:, VELOCITY_NAMES_XYZ] = self.data[VELOCITY_NAMES_XYZ].values @ self.rotation
+        self.reset_filter()
+        del self.rotation
+        print("Rotation was reset.")
+
+    def reset_rotation_parallel(self): # includes filter reset
+        """
+            Reset rotation of coordinates. Resets filter too.
+
+            ATTENTION: After rotation-undoing, spatial data filters you apply need to be written with the new coordinates in mind!
+        """
+        if not hasattr(self, "rotation"):
+            print("No rotation found to reset.")
+            return
+        self.reset_filter_parallel()
+        del self.rotation
+        print("Rotation was reset.")
+    
+    # ----- Filter methods -----
+
+    def reset_filter(self):
+        """
+        Method to reset the filter to include all data.
+        Resets the filter so that no data is excluded by default.
+        """
+        self.filter = self.data.index >= 0 # this can just be a ones-array of same length as data 
+        print("Filter has been reset.")       
+
+    def reset_filter_parallel(self):
+        self.particle_filter_parallel = {PDG_CODES.keys()} # a set of all particle names that are supported
+        self.energy_filter_parallel = [-np.inf, +np.inf]
+        self.x_filter_parallel = [-np.inf, +np.inf]
+        self.y_filter_parallel = [-np.inf, +np.inf]
+        self.z_filter_parallel = [-np.inf, +np.inf]
+        print("Parallel filter was reset.")
+
+    def apply_filter(self, particle=None, energy=None, x=None, y=None, z=None): # for large data would it make sense to filter while creating the object (i.e. in the constructor) so not all data is read into memory?
+        """
+        Applies filters to the particle data based on the given criteria:
+        - particle: Type of particle (e.g., 'proton', 'neutron')
+        - energy: Energy range to filter particles by
+        - x: x-position range to filter particles by
+        - y: y-position range to filter particles by
+        - z: z-position range to filter particles by
+        
+        If you want to reset the filter, use the method "reset_filter()".
+        """
+        # If filter hasn't been initialized yet:
         if not hasattr(self, "filter"):
             self.reset_filter()
-        return self.data[self.filter]
+        # If a particle type is specified, filter by the particle's PDG code
+        if particle:
+            self.filter &= (self.data[PDG_CODE_NAME] == PDG_CODES[particle])
+        # If an energy range is specified, filter particles within that range
+        if energy:
+            energy =[min(energy), max(energy)]
+            self.filter &= (self.data[ENERGY_NAME] >= energy[0])
+            self.filter &= (self.data[ENERGY_NAME] <= energy[1])
+        # If an x-position range is specified, filter particles within that range
+        if x:
+            x = [min(x), max(x)]
+            self.filter &= (self.data[POSITION_NAME_X] >= x[0])
+            self.filter &= (self.data[POSITION_NAME_X] <= x[1])
+        # If a y-position range is specified, filter particles within that range
+        if y:
+            y = [min(y), max(y)]
+            self.filter &= (self.data[POSITION_NAME_Y] >= y[0])
+            self.filter &= (self.data[POSITION_NAME_Y] <= y[1])
+        # If a z-position range is specified, filter particles within that range
+        if z:
+            z = [min(z), max(z)]
+            self.filter &= (self.data[POSITION_NAME_Z] >= z[0])
+            self.filter &= (self.data[POSITION_NAME_Z] <= z[1])
+        if not self.filter.any():
+            print("The filter has lead to an empty selection. It will be reset.")
+            self.reset_filter()
+        else:
+            print("The following non-expanding (data exclusion only) filter has been applied:",
+                  "particle:", str(particle),
+                  "energy:", str(energy),
+                  "x:", str(x),
+                  "y:", str(y),
+                  "z:", str(z))
+
+    def apply_filter_parallel(self, particles=None, energy=None, x=None, y=None, z=None):
+        """
+        This updates filters but does not calculate data yet. The filters are non-expanding (narrowing down the data selection).
+        Any parameter that is None will not cause filtering in that dimension.
+        - particles: list or set or similar of particle names strings as e.g. ["neutron"]
+        - energy, x, y, or z: something that has a minimum and maximum
+        """
+        if not hasattr(self, "particle_parallel"):
+            self.reset_filter_parallel()
+        if particles:
+            particles = set(particles).intersection(self.particle_filter_parallel)
+            if len(particles) == 0:
+                self.reset_filter_parallel()
+                print("Attention: Your filter has lead to an empty selection. The entire filter has been reset.")
+                return
+            else:
+                self.particle_filter_parallel = particles
+        if energy:
+            energy = [max(self.energy_filter_parallel[0], min(energy)), min(self.energy_filter_parallel[1], max(energy))] # minimum can only increase, maximum can only decrease (filter does not expand)
+            self.energy_filter_parallel = energy
+        if x:
+            x = [max(self.x_filter_parallel[0], min(x)), min(self.x_filter_parallel[1], max(x))]
+            self.x_filter_parallel = x
+        if y:
+            y = [max(self.y_filter_parallel[0], min(y)), min(self.y_filter_parallel[1], max(y))]
+            self.y_filter_parallel = y
+        if z:
+            z = [max(self.z_filter_parallel[0], min(z)), min(self.z_filter_parallel[1], max(z))]
+            self.z_filter_parallel = z        
+        for f in (energy, x, y, z):
+            if f[0] >= f[1]:
+                self.reset_filter_parallel()
+                print("Attention: Your filter has lead to an empty selection. The entire filter has been reset.")
+                return
+        print("Parallel filter has been updated to the following:",
+               "particle:", str(self.particle_filter_parallel),
+               "energy:", str(self.energy_filter_parallel),
+               "x:", str(self.x_filter_parallel),
+               "y:", str(self.y_filter_parallel),
+               "z:", str(self.z_filter_parallel))
     
+
+
+    # ----- 3. Calculations logic -----
+        
+  
     @property
     def brightness(self):
         """
@@ -420,55 +661,7 @@ class BrightifyModel:
             np.abs(fc.sum_f(slice_filt_i[WEIGHT_NAME]**2) / sum_squared_weight - mean_squared_weight * window_weight) /
             (window_weight - 1)
         )
-    
-    def reset_filter(self):
-        """
-        Method to reset the filter to include all data.
-        Resets the filter so that no data is excluded by default.
-        """
-        self.filter = self.data.index >= 0 # this can just be a ones-array of same length as data        
-    
-    def apply_filter(self, particle=None, energy=None, x=None, y=None): # for large data would it make sense to filter while creating the object (i.e. in the constructor) so not all data is read into memory?
-        """
-        Applies filters to the particle data based on the given criteria:
-        - particle: Type of particle (e.g., 'proton', 'neutron')
-        - energy: Energy range to filter particles by
-        - x: x-position range to filter particles by
-        - y: y-position range to filter particles by
-        
-        If you want to reset the filter, use the method "reset_filter()".
-        """
-
-        # If filter hasn't been initialized yet:
-        if not hasattr(self, "filter"):
-            self.reset_filter()
-
-        # If a particle type is specified, filter by the particle's PDG code
-        if particle:
-            self.particle = particle
-            self.filter &= (self.data[PDG_CODE_NAME] == PDG_CODES[particle])
-        
-        # If an energy range is specified, filter particles within that range
-        if energy:
-            self.energy = (min(energy), max(energy))
-            self.filter &= (self.data[ENERGY_NAME] >= self.energy[0])
-            self.filter &= (self.data[ENERGY_NAME] <= self.energy[1])
-            
-        # If an x-position range is specified, filter particles within that range
-        if x:
-            self.xf = (min(x), max(x))
-            self.filter &= (self.data[POSITION_NAME_X] >= self.xf[0])
-            self.filter &= (self.data[POSITION_NAME_X] <= self.xf[1])
-            
-        # If a y-position range is specified, filter particles within that range
-        if y:
-            self.yf = (min(y), max(y))
-            self.filter &= (self.data[POSITION_NAME_Y] >= self.yf[0])
-            self.filter &= (self.data[POSITION_NAME_Y] <= self.yf[1])
-
-        print("filter has been applied")
-
-
+  
     def calculate_properties(self, data_filt, shape1D, shape2D, 
                              slice_filter_func, points, forced_direction=None):
         """
