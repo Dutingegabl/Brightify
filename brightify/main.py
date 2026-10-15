@@ -116,7 +116,7 @@ class BrightifyModel:
                  outputFile=None,
                  primary_protons=None,
                  pCurrent=None,   
-                 dir_size=None
+                 dir_size=None,
                  ): 
         """
         Initializes the BrightifyModel class.
@@ -167,8 +167,8 @@ class BrightifyModel:
 
         # --- 2. Data loading ---
 
-        # this needs to be a pandas DataFrame
-        self.data = read_data(inputFile=self.inputFile, input_is_ascii=self.input_is_ascii)
+        # this creates a pandas DataFrame
+        self.reset_data()
              
         # --- 3. Filter initialization ---
         
@@ -252,6 +252,8 @@ class BrightifyModel:
         - include_filter = True will include the filter (length = number of particles in input data).
         - include_data = True will include the input data (self.data, which is a pandas dataFrame).
             WARNING: File might get large.
+
+        Data can be loaded into the model again after loading via the method reset_data(). 
         """
         dumpFile = Path(dumpFile).resolve()
         # Prepare file path
@@ -279,13 +281,23 @@ class BrightifyModel:
         print("A dump file of the model of type "+self.__class__.__name__+" has been saved to "+str(dumpFile)
               +" and the following attributes were included: "+str(list(attrDict.keys())).strip("[]"))
 
-    # ----- 3. Calculations logic -----
+    # ----- Data methods -----
 
-    # def coordinate_transform(self):
-    #     - coordinate_system: This program expects the z coordinate direction to be the normal direction of the brightness maps. \
-    #                 You may want to transform your data beforehand yourself, or input here three Euler angles (alpha, beta, gamma) (in degrees).
-    #                 alpha determines how much the x axis needs to be 
-    
+    def reset_data(self, inputFile=None, input_is_ascii=None): # includes filter reset
+        """
+            (Re)loads data, resets filter
+        """
+        if inputFile is None:
+            inputFile = self.inputFile
+        else:
+            self.inputFile = Path(inputFile).resolve()
+        if input_is_ascii is None: 
+            input_is_ascii = self.input_is_ascii
+        else:
+            self.input_is_ascii = input_is_ascii
+        self.data = read_data(inputFile=inputFile, input_is_ascii=input_is_ascii)
+        self.reset_filter()
+
     @property
     def data_filtered(self):
         """
@@ -330,8 +342,9 @@ class BrightifyModel:
         Method to reset the filter to include all data.
         Resets the filter so that no data is excluded by default.
         """
-        self.filter = self.data.index >= 0 # this can just be a ones-array of same length as data        
-    
+        self.filter = self.data.index >= 0 # this can just be a ones-array of same length as data 
+        print("Filter has been reset.")       
+
     def apply_filter(self, particle=None, energy=None, x=None, y=None): # for large data would it make sense to filter while creating the object (i.e. in the constructor) so not all data is read into memory?
         """
         Applies filters to the particle data based on the given criteria:
@@ -339,14 +352,15 @@ class BrightifyModel:
         - energy: Energy range to filter particles by
         - x: x-position range to filter particles by
         - y: y-position range to filter particles by
+        - z: z-position range to filter particles by
         
         If you want to reset the filter, use the method "reset_filter()".
         """
-
+        
         # If filter hasn't been initialized yet:
         if not hasattr(self, "filter"):
             self.reset_filter()
-
+        
         # If a particle type is specified, filter by the particle's PDG code
         if particle:
             self.particle = particle
@@ -373,6 +387,41 @@ class BrightifyModel:
         print("filter has been applied")
 
 
+
+    # ----- 3. Calculations logic -----
+        
+  
+    @property
+    def brightness(self):
+        """
+        Property method to calculate brightness based on provided parameters.
+        Calculates brightness based on particle current, primary protons,
+        position size, and direction size.
+        """
+        return (self.window_weights * self.pCurrent / self.primary_protons / self.pos_size / self.dir_size)
+    
+    @property
+    def r_err(self):
+        """
+        method to calculate relative error based on the standard deviation
+        (sigma).
+        """
+        
+        return self.sigma / np.sqrt(self.window_weights)
+
+    def compute_sigma(self, slice_filt_i, sum_squared_weight, mean_squared_weight, window_weight):
+        """
+        Compute the standard deviation (sigma) for a given filtered data slice.
+        """
+        if window_weight <= 1:
+            return 0  # Prevent division by zero
+    
+        # Compute sigma using precomputed values
+        return np.sqrt(
+            np.abs(fc.sum_f(slice_filt_i[WEIGHT_NAME]**2) / sum_squared_weight - mean_squared_weight * window_weight) /
+            (window_weight - 1)
+        )
+  
     def calculate_properties(self, data_filt, shape1D, shape2D, 
                              slice_filter_func, points, forced_direction=None):
         """
