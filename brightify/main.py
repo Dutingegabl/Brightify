@@ -144,7 +144,7 @@ class BrightifyModel:
     # Note that the super class constructor should only contain parameters that all the sub-class constructors have in common.
     
     
-    #  ----- 1. Object creation logic -----
+    # ----- Object creation logic -----
 
     # Classical constructor
     def __init__(self, 
@@ -154,18 +154,22 @@ class BrightifyModel:
                  primary_protons=None,
                  pCurrent=None,   
                  dir_size=None,
+                 parallel=False,
+                 chunk_size=100_000,
                  ): 
         """
         Initializes the BrightifyModel class.
         
         Parameters:
         - inputFile: Path to the input file containing particle data (optional). Default accepted format is .mcpl(.gz).
-        - input_is_ascii: Whether you are using ascii input separated by whitespace instead of .mcpl(.gz) files. 
+        - input_is_ascii: Whether you are using ascii input separated by whitespace instead of .mcpl(.gz) files.
         - outputFile: Optional path to file in which previous BrightifyModel was saved (pickle dump of attributes).
           Note: Please use brightify.load_model(outputFile) instead
         - primary_protons: Number of primary protons (used for brightness calculation). Can be found in standard output file of MC code
         - pCurrent: Proton current (used for brightness calculation).
         - dir_size: Size of the solid-angle window (in steradians) around the direction used for brightness calculation
+        - parallel: Set to True if you want calculations to be executed in multiple processes in parallel.
+        - chunk_size: Amount of particles per input data chunk distributed to parallel processes.
         """
 
         # --- 0. catch (deprecated) case where user gives a dump file ---
@@ -202,20 +206,37 @@ class BrightifyModel:
         except (ValueError, TypeError): raise ValueError("dir_size must be float-convertible")
         self.dir_size = dir_size
 
+        # parallel
+        try: parallel = bool(parallel)
+        except (ValueError, TypeError): raise ValueError("parallel must be bool-convertible")
+        self.parallel = parallel
+
+        # chunk_size
+        try: chunk_size = int(chunk_size)
+        except (ValueError, TypeError): raise ValueError("chunk_size must be int-convertible")
+        self.chunk_size = chunk_size
+
         # --- 2. Data loading ---
 
+        if not parallel:
         # this creates a pandas DataFrame
-        self.reset_data()
-             
+            self.reset_data()
+        else:
+        # a generator for small dataframes:
+            self.reset_data_parallel()
+            
         # --- 3. Filter initialization ---
         
         # Reset filter to include all data initially    
-        self.reset_filter()
-
+        if not parallel:
+            self.reset_filter()
+        else:
+            self.reset_filter_parallel()
+            
         # --- 4. Initialize calculation method variable (holds most recent applied calculation method string e.g. "adaptive") ---
         self.calc_method = None
 
-    # Alternative: construct object of model from saved dump
+    # Alternative constructor: loading model from dump file
     @classmethod
     def load_model(cls, dumpFile, enforce_type=False):
         """
@@ -240,16 +261,39 @@ class BrightifyModel:
         model.__dict__.update(attrDict)
         print("Model of type "+modelType.__name__+" was loaded from "+str(dumpFile))
         print("The following attributes were filled with values: "+str(list(attrDict.keys())).strip("[]"))
-        return model
 
-    # ----- 2. Saving and loading logic -----
+        # check the model's attributes now:
+        # data
+        if not model.parallel:
+            if hasattr(model, "data"):
+                print("The loaded model contains data. But you can (re)set it how you like using reset_data().")
+            else:
+                print("The loaded model contains no data. You may want to run reset_data().")          
+        else:
+            print("The loaded model was using parallel processing and contains no data. See reset_data_parallel().")
+        
+        # filter:
+        if not model.parallel:
+            if hasattr(model, "filter"):
+                print("The loaded model contains a filter. If you want to reset it, use reset_filter().")
+            else:
+                if hasattr(model, "data"):
+                    print("The loaded model contains data but no filter. Please see reset_filter().")
+        else:
+            print("The loaded model was using parallel processing and contains no filter. See reset_filter_parallel().")
+
+        return model
+    
+    # ----- Saving logic (dump file creation) -----
 
     SAVE_KEYS = ['inputFile',
                  'input_is_ascii',
                  'primary_protons',
                  'pCurrent',
                  'dir_size',
-                 'calc_method']
+                 'calc_method',
+                 'parallel',
+                 'chunk_size']
         # This class variable is read upon calling the saving method on an object whose type is this class.
         # It determines which attributes of the object are saved when the saving method is called on that object.
         # DEFINE THE IDENTICALLY NAMED VARIABLE in the child classes; their lists will be added to this one,
@@ -290,7 +334,8 @@ class BrightifyModel:
         - include_data = True will include the input data (self.data, which is a pandas dataFrame).
             WARNING: File might get large.
 
-        Data can be loaded into the model again after loading via the method reset_data(). 
+        Note: For parallel mode, filter and data cannot be included. 
+        In any case, data can be loaded into the model again after loading via the method reset_data(_parallel). 
         """
         dumpFile = Path(dumpFile).resolve()
         # Prepare file path
@@ -304,8 +349,9 @@ class BrightifyModel:
         # include/exclude filter:
         if not include_filter and "filter" in attrDict.keys():
             attrDict.pop("filter") 
-        elif include_filter and hasattr(self, "filter"):
-            attrDict["filter"] = getattr(self, "filter")
+        elif include_filter:
+            if hasattr(self, "filter"):
+                attrDict["filter"] = getattr(self, "filter")
         # include/exclude data:
         if not include_data and "data" in attrDict.keys():
             attrDict.pop("data") 
@@ -322,7 +368,7 @@ class BrightifyModel:
 
     def reset_data(self, inputFile=None, input_is_ascii=None): # includes filter reset
         """
-            (Re)loads data, resets filter
+            (Re)loads data, disables parallel processing, deletes parallel data, resets filter
         """
         if inputFile is None:
             inputFile = self.inputFile
@@ -333,7 +379,32 @@ class BrightifyModel:
         else:
             self.input_is_ascii = input_is_ascii
         self.data = read_data(inputFile=inputFile, input_is_ascii=input_is_ascii)
+        self.parallel=False
+        if hasattr(self, "data_gen"):
+            del self.data_gen
         self.reset_filter()
+
+    def reset_data_parallel(self, inputFile=None, input_is_ascii=None, chunk_size=None): # includes filter reset
+        """
+            (Re)loads data, enables parallel processing, deletes non-parallel data, resets filter
+        """
+        if inputFile is None:
+            inputFile = self.inputFile
+        else:
+            self.inputFile = Path(inputFile).resolve()
+        if input_is_ascii is None: 
+            input_is_ascii = self.input_is_ascii
+        else:
+            self.input_is_ascii = input_is_ascii
+        if chunk_size is None:
+            chunk_size = self.chunk_size
+        else:
+            self.chunk_size = chunk_size
+        self.data_gen = read_data(inputFile=inputFile, input_is_ascii=input_is_ascii, return_generator=True, chunk_size=chunk_size)
+        self.parallel = True
+        if hasattr(self, "data"):
+            del self.data
+        self.reset_filter_parallel()
 
     @property
     def data_filtered(self):
@@ -343,6 +414,20 @@ class BrightifyModel:
         """
         return self.data[self.filter]
     
+    def data_filtered_parallel(self):
+        """
+        Returns a generator for filtered data chunks
+        """
+        for chunk in self.data_gen:
+            chunk = chunk[
+                chunk[PDG_CODE_NAME].isin([PDG_CODES[name] for name in self.particle_filter_parallel]) &
+                chunk[ENERGY_NAME].between(*self.energy_filter_parallel) &
+                chunk[POSITION_NAME_X].between(*self.x_filter_parallel) &
+                chunk[POSITION_NAME_Y].between(*self.y_filter_parallel) &
+                chunk[POSITION_NAME_Z].between(*self.z_filter_parallel)
+            ]
+            yield chunk
+
     @property
     def brightness(self):
         """
@@ -382,6 +467,13 @@ class BrightifyModel:
         self.filter = self.data.index >= 0 # this can just be a ones-array of same length as data 
         print("Filter has been reset.")       
 
+    def reset_filter_parallel(self):
+        self.particle_filter_parallel = {PDG_CODES.keys()} # a set of all particle names that are supported
+        self.energy_filter_parallel = [-np.inf, +np.inf]
+        self.x_filter_parallel = [-np.inf, +np.inf]
+        self.y_filter_parallel = [-np.inf, +np.inf]
+        print("Parallel filter was reset.")
+
     def apply_filter(self, particle=None, energy=None, x=None, y=None): # for large data would it make sense to filter while creating the object (i.e. in the constructor) so not all data is read into memory?
         """
         Applies filters to the particle data based on the given criteria:
@@ -399,21 +491,20 @@ class BrightifyModel:
         
         # If a particle type is specified, filter by the particle's PDG code
         if particle:
-            self.particle = particle
             self.filter &= (self.data[PDG_CODE_NAME] == PDG_CODES[particle])
         
         # If an energy range is specified, filter particles within that range
         if energy:
-            self.energy = (min(energy), max(energy))
-            self.filter &= (self.data[ENERGY_NAME] >= self.energy[0])
-            self.filter &= (self.data[ENERGY_NAME] <= self.energy[1])
-            
+            energy =[min(energy), max(energy)]
+            self.filter &= (self.data[ENERGY_NAME] >= energy[0])
+            self.filter &= (self.data[ENERGY_NAME] <= energy[1])
+        
         # If an x-position range is specified, filter particles within that range
         if x:
-            self.xf = (min(x), max(x))
-            self.filter &= (self.data[POSITION_NAME_X] >= self.xf[0])
-            self.filter &= (self.data[POSITION_NAME_X] <= self.xf[1])
-            
+            x = [min(x), max(x)]
+            self.filter &= (self.data[POSITION_NAME_X] >= x[0])
+            self.filter &= (self.data[POSITION_NAME_X] <= x[1])
+        
         # If a y-position range is specified, filter particles within that range
         if y:
             self.yf = (min(y), max(y))
@@ -422,6 +513,42 @@ class BrightifyModel:
 
         print("filter has been applied")
 
+    def apply_filter_parallel(self, particles=None, energy=None, x=None, y=None):
+        """
+        This updates filters but does not calculate data yet. The filters are non-expanding (narrowing down the data selection).
+        Any parameter that is None will not cause filtering in that dimension.
+        - particles: list or set or similar of particle names strings as e.g. ["neutron"]
+        - energy, x, or y: something that has a minimum and maximum
+        """
+        if not hasattr(self, "particle_parallel"):
+            self.reset_filter_parallel()
+        if particles:
+            particles = set(particles).intersection(self.particle_filter_parallel)
+            if len(particles) == 0:
+                self.reset_filter_parallel()
+                print("Attention: Your filter has lead to an empty selection. The entire filter has been reset.")
+                return
+            else:
+                self.particle_filter_parallel = particles
+        if energy:
+            energy = [max(self.energy_filter_parallel[0], min(energy)), min(self.energy_filter_parallel[1], max(energy))] # minimum can only increase, maximum can only decrease (filter does not expand)
+            self.energy_filter_parallel = energy
+        if x:
+            x = [max(self.x_filter_parallel[0], min(x)), min(self.x_filter_parallel[1], max(x))]
+            self.x_filter_parallel = x
+        if y:
+            y = [max(self.y_filter_parallel[0], min(y)), min(self.y_filter_parallel[1], max(y))]
+            self.y_filter_parallel = y
+        for f in (energy, x, y):
+            if f[0] >= f[1]:
+                self.reset_filter_parallel()
+                print("Attention: Your filter has lead to an empty selection. The entire filter has been reset.")
+                return
+        print("Parallel filter has been updated to the following:",
+               "particle:", str(self.particle_filter_parallel),
+               "energy:", str(self.energy_filter_parallel),
+               "x:", str(self.x_filter_parallel),
+               "y:", str(self.y_filter_parallel))
 
 
     # ----- 3. Calculations logic -----
