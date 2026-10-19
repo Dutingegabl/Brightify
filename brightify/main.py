@@ -219,7 +219,7 @@ class BrightifyModel:
         self.mean_directions_spher = np.full(shape2D, np.nan)
         self.mean_directions_window = np.full(shape2D, np.nan)
     
-        for i, vec in tqdm(enumerate(points), desc='common', total=shape1D, ascii=' #'):
+        for i, vec in tqdm(enumerate(points), desc='Calculating', total=shape1D, ascii=' #'):
             slice_i = slice_filter_func(data_filt, vec)
             if slice_i.empty:
                 continue
@@ -282,7 +282,7 @@ class BrightifyModel:
         self.hist_edges = [None] * shape1D
     
         # Loop through the points
-        for i, vec in tqdm(enumerate(points), desc='common', total=shape1D, ascii=' #'):
+        for i, vec in tqdm(enumerate(points), desc='Calculating', total=shape1D, ascii=' #'):
             # Slice data
             slice_i = slice_filter_func(data_filt, vec)  
             if len(slice_i) == 0:
