@@ -1,0 +1,35 @@
+<?xml version="1.0" ?>
+<KDSource>
+	<J units="1/s">1.0</J>
+	<kernel>g</kernel>
+	<PList>
+		<pt>n</pt>
+		<mcplname>/home/jhonal/Brightify/examples/uniform/output.mcpl.gz</mcplname>
+		<trasl/>
+		<rot/>
+		<x2z>0</x2z>
+	</PList>
+	<Geom order="4">
+		<Energy>
+			<dim>1</dim>
+			<params nps="0"/>
+		</Energy>
+		<Time>
+			<dim>1</dim>
+			<params nps="0"/>
+		</Time>
+		<Vol>
+			<dim>3</dim>
+			<params nps="6">-inf inf -inf inf -inf inf</params>
+		</Vol>
+		<Isotrop>
+			<dim>3</dim>
+			<params nps="3">0 0 0</params>
+		</Isotrop>
+		<trasl/>
+		<rot/>
+	</Geom>
+	<scaling>1.00000000e+00 9.08736502e-04 2.87946241e-01 2.93733530e-01
+ 1.86183998e-09 5.54788960e-01 5.54788960e-01 5.54788960e-01</scaling>
+	<BW variable="0">0.22681186568437656</BW>
+</KDSource>
