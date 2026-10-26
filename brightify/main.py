@@ -10,6 +10,7 @@ import pickle as pkl
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import mcpl
+from concurrent.futures import ProcessPoolExecutor
 
 from brightify import fast_computation as fc
 
@@ -358,9 +359,9 @@ class BrightifyModel:
 
     # ----- Data methods -----
 
-    def reset_data(self, inputFile=None, input_is_ascii=None): # includes filter reset
+    def reset_data(self, inputFile=None, input_is_ascii=None):
         """
-            (Re)loads data, disables parallel processing, deletes parallel data, resets filter
+            (Re)loads data, disables parallel processing, deletes parallel data
         """
         if inputFile is None:
             inputFile = self.inputFile
@@ -374,11 +375,10 @@ class BrightifyModel:
         self.parallel=False
         if hasattr(self, "data_gen"):
             del self.data_gen
-        self.reset_filter()
 
-    def reset_data_parallel(self, inputFile=None, input_is_ascii=None, chunk_size=None): # includes filter reset
+    def reset_data_parallel(self, inputFile=None, input_is_ascii=None, chunk_size=None):
         """
-            (Re)loads data, enables parallel processing, deletes non-parallel data, resets filter
+            (Re)loads data, enables parallel processing, deletes non-parallel data
         """
         if inputFile is None:
             inputFile = self.inputFile
@@ -396,7 +396,6 @@ class BrightifyModel:
         self.parallel = True
         if hasattr(self, "data"):
             del self.data
-        self.reset_filter_parallel()
 
     @property
     def data_filter(self):
@@ -545,6 +544,32 @@ class BrightifyModel:
             np.abs(fc.sum_f(slice_filt_i['Wt']**2) / Wt_sq_sum - Am * window_weight) /
             (window_weight - 1)
         )
+
+
+    def calculate_properties_parallel(self, data_filt_gen, shape1D, shape2D, 
+                             slice_filter_func, points, forced_direction=None):
+
+        
+        
+        def calc_parallel(data_filt):
+
+
+
+
+            weights = data_filt['Wt']
+            Wt_sq_sum = fc.sum_f(weights**2)
+            return Wt_sq_sum, len(weights)
+        
+        
+        with ProcessPoolExecutor() as executor:
+            results = list(executor.map(calc_parallel, data_filt_gen))
+
+        Wt_sq_sum = sum([r[0] for r in results])
+        total_len = sum([r[1] for r in results])
+        Am = Wt_sq_sum / total_len
+
+
+
   
     def calculate_properties(self, data_filt, shape1D, shape2D, 
                              slice_filter_func, points, forced_direction=None):
