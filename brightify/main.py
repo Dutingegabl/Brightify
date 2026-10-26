@@ -415,8 +415,7 @@ class BrightifyModel:
                 chunk['Kf'].isin([PARTICLE[name] for name in self.particle_filter_parallel]) &
                 chunk['e'].between(*self.energy_filter_parallel) &
                 chunk['x'].between(*self.x_filter_parallel) &
-                chunk['y'].between(*self.y_filter_parallel) &
-                chunk['z'].between(*self.z_filter_parallel)
+                chunk['y'].between(*self.y_filter_parallel)
             ]
             yield chunk
 
