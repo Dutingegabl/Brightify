@@ -542,6 +542,14 @@ class BrightifyModel:
         )
 
     @staticmethod
+    def compute_sigma_parallel(window_weight_squared, Wt_sq_sum, Am, window_weight):
+        if window_weight <= 1:
+            return 0
+        return np.sqrt(np.abs(window_weight_squared / Wt_sq_sum - Am * window_weight) / (window_weight - 1))
+
+
+
+    @staticmethod
     def execute_parallel(func, *iterable_s, max_processes=4, **kwargs):
         """
         This distributes work done to individual elements from the iterable(s) to parallel processes.
@@ -560,62 +568,72 @@ class BrightifyModel:
         return results
 
 
-    def calculate_properties_parallel(self, data_filt_gen, shape1D, shape2D, 
-                             slice_filter_func, points, forced_direction=None):
+    # def calculate_properties_parallel(self, data_filt_gen, shape1D, shape2D, 
+    #                          slice_filter_func, points, forced_direction=None):
 
-        def calc_parallel(data_filt, shape1D, shape2D, slice_filter_func, points, forced_direction):
-            this_n = len(data_filt['Wt'])
-            this_Wt_sq_sum = fc.sum_f(data_filt['Wt']**2)
+    #     def calc_parallel(data_filt, shape1D, shape2D, slice_filter_func, points, forced_direction, dir_window, compute_sigma):
+    #         this_n = len(data_filt['Wt'])
+    #         this_Wt_sq_sum = fc.sum_f(data_filt['Wt']**2)
             
-            total_neutrons = np.full(shape1D, np.nan)
-            total_weights = np.full(shape1D, np.nan)
-            window_weights = np.full(shape1D, np.nan)
-            total_mean = np.full(shape1D, np.nan)
-            relative_error = np.full(shape1D, np.nan)
-            sigma = np.full(shape1D, np.nan)
-            mean_directions = np.full(shape2D, np.nan)
-            mean_directions_spher = np.full(shape2D, np.nan)
-            mean_directions_window = np.full(shape2D, np.nan)
+    #         neutrons = np.full(shape1D, np.nan)
+    #         weights = np.full(shape1D, np.nan)
+    #         window_weights = np.full(shape1D, np.nan)
+    #         mean_directions = np.full(shape2D, np.nan)
+    #         mean_directions_spher = np.full(shape2D, np.nan)
+    #         mean_directions_window = np.full(shape2D, np.nan)
+    #         window_squared_weights = np.full(shape1D, np.nan)
 
-            for i, vec in enumerate(points):
-                slice_i = slice_filter_func(data_filt, vec)
-                if slice_i.empty:
-                    continue
+    #         for i, vec in enumerate(points):
+    #             slice_i = slice_filter_func(data_filt, vec)
+    #             if slice_i.empty:
+    #                 continue
+    #             neutrons[i] = len(slice_i)
+    #             weights[i] = fc.sum_f(slice_i.Wt)
+    #             # Use forced direction if provided, else compute mean direction
+    #             if forced_direction is not None:
+    #                 direction_vec = forced_direction
+    #             else:
+    #                 direction_vec = fc.direction_f(fc.mean_f(slice_i[vel], slice_i.Wt))
+    #             mean_directions[i] = direction_vec
+    #             mean_directions_spher[i] = fc.cart2spher(*direction_vec)
+    #             # Apply angular filter
+    #             slice_filt_i = slice_i[fc.cos_f(slice_i[vel], direction_vec) >= dir_window]
+    #             window_weights[i] = fc.sum_f(slice_filt_i.Wt)
+                
+    #             # Sigma and relative error
+    #             window_squared_weights[i] = fc.sum_f(slice_filt_i.Wt**2)
 
-                self.total_neutrons[i] = len(slice_i)
-                self.total_weights[i] = fc.sum_f(slice_i.Wt)
-                self.total_mean[i] = np.mean(slice_i.Wt)
+    #             # Weighted direction
+    #             mean_directions_window[i] = direction_vec * window_weights[i]
 
-                # Use forced direction if provided, else compute mean direction
-                if forced_direction is not None:
-                    direction_vec = forced_direction
-                else:
-                    direction_vec = fc.direction_f(fc.mean_f(slice_i[vel], slice_i.Wt))
+    #         return {"this_Wt_sq_sum":this_Wt_sq_sum,
+    #                 "this_n": this_n,
+    #                 "neutrons": neutrons,
+    #                 "weights": weights,
+    #                 "window_weights": window_weights,
+    #                 "mean_directions": mean_directions,
+    #                 "mean_directions_spher": mean_directions_spher,
+    #                 "mean_directions_window": mean_directions_window,
+    #                 "window_squared_weights": window_squared_weights}
 
-                self.mean_directions[i] = direction_vec
-                self.mean_directions_spher[i] = fc.cart2spher(*direction_vec)
+    #     results = self.execute_parallel(calc_parallel,
+    #                                     data_filt_gen,
+    #                                     shape1D=shape1D, shape2D=shape2D, slice_filter_func=slice_filter_func, points=points, forced_direction=forced_direction)
 
-                # Apply angular filter
-                slice_filt_i = slice_i[fc.cos_f(slice_i[vel], direction_vec) >= self.dir_window]
-                self.window_weights[i] = fc.sum_f(slice_filt_i.Wt)
+    #     Wt_sq_sum = sum([r["this_Wt_sq_sum"] for r in results])
+    #     n = sum([r["this_n"] for r in results])
+    #     Am = Wt_sq_sum / n # mean squared weight over all chunks/processes
 
-                # Sigma and relative error
-                self.sigma[i] = self.compute_sigma(slice_filt_i, Wt_sq_sum, Am, self.window_weights[i])
-                self.relative_error[i] = self.r_err[i]
-
-                # Weighted direction
-                self.mean_directions_window[i] = direction_vec * self.window_weights[i]
-
-            return this_Wt_sq_sum, this_n        
+    #     neutrons = np.sum([r["neutrons"] for r in results])
+    #     weights = np.sum([r["weights"] for r in results])
+    #     window_weights = np.sum([r["window_weights"] for r in results])
+    #     mean = weights / neutrons
 
 
-        results = self.execute_parallel(calc_parallel,
-                                        data_filt_gen,
-                                        shape1D=shape1D, shape2D=shape2D, slice_filter_func=slice_filter_func, points=points, forced_direction=forced_direction)
+    #     sigma[i] = compute_sigma_parallel(window_squared_weights[i], Wt_sq_sum, Am, window_weights[i])
+    #     relative_error[i] = sigma[i] / np.sqrt(window_weights[i])
 
-        total_Wt_sq_sum = sum([r[0] for r in results])
-        total_n = sum([r[1] for r in results])
-        total_Am = total_Wt_sq_sum / total_n # mean squared weight over all chunks/processes
+        
 
 
 
