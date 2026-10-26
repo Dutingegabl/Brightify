@@ -212,11 +212,11 @@ class BrightifyModel:
         # --- 2. Data loading ---
 
         if not parallel:
-        # this creates a pandas DataFrame
+        # this creates a pandas DataFrame at self.data
             self.reset_data()
         else:
         # a generator for small dataframes:
-            self.reset_data_parallel()
+            pass # we will run self.reset_data_parallel(), which returns a generator, only on demand (e.g. via data_filter_parallel())
             
         # --- 3. Filter initialization ---
         
@@ -361,41 +361,29 @@ class BrightifyModel:
 
     def reset_data(self, inputFile=None, input_is_ascii=None):
         """
-            (Re)loads data, disables parallel processing, deletes parallel data
+            (Re)loads data, (re-)assigns inputFile and input_is_ascii attributes, disables parallel processing
         """
-        if inputFile is None:
-            inputFile = self.inputFile
-        else:
+        if inputFile is not None:
             self.inputFile = Path(inputFile).resolve()
-        if input_is_ascii is None: 
-            input_is_ascii = self.input_is_ascii
-        else:
+        if input_is_ascii is not None: 
             self.input_is_ascii = input_is_ascii
-        self.data = read_data(inputFile=inputFile, input_is_ascii=input_is_ascii)
+        self.data = read_data(inputFile=self.inputFile, input_is_ascii=self.input_is_ascii)
         self.parallel=False
-        if hasattr(self, "data_gen"):
-            del self.data_gen
 
     def reset_data_parallel(self, inputFile=None, input_is_ascii=None, chunk_size=None):
         """
-            (Re)loads data, enables parallel processing, deletes non-parallel data
+            RETURNS a fresh data generator, (re-)assigns inputFile, input_is_ascii and chunk_size attributes, enables parallel processing, deletes non-parallel data.
         """
-        if inputFile is None:
-            inputFile = self.inputFile
-        else:
-            self.inputFile = Path(inputFile).resolve()
-        if input_is_ascii is None: 
-            input_is_ascii = self.input_is_ascii
-        else:
+        if inputFile is not None:
+            self.inputFile = Path(inputFile).resolve()            
+        if input_is_ascii is not None: 
             self.input_is_ascii = input_is_ascii
-        if chunk_size is None:
-            chunk_size = self.chunk_size
-        else:
+        if chunk_size is not None:
             self.chunk_size = chunk_size
-        self.data_gen = read_data(inputFile=inputFile, input_is_ascii=input_is_ascii, return_generator=True, chunk_size=chunk_size)
         self.parallel = True
         if hasattr(self, "data"):
             del self.data
+        return read_data(inputFile=self.inputFile, input_is_ascii=self.input_is_ascii, return_generator=True, chunk_size=self.chunk_size)
 
     @property
     def data_filter(self):
@@ -407,14 +395,19 @@ class BrightifyModel:
     
     def data_filter_parallel(self):
         """
-        Returns a generator for filtered data chunks
+        Returns a fresh generator for filtered data chunks
         """
-        for chunk in self.data_gen:
+        data_gen = self.reset_data_parallel()
+        particle_f = self.particle_filter_parallel.copy() # here we copy the filter objects so during iteration over the data chunks we will not be able to change the filter
+        energy_f = self.energy_filter_parallel.copy()
+        x_f = self.x_filter_parallel.copy()
+        y_f = self.y_filter_parallel.copy()
+        for chunk in data_gen:
             chunk = chunk[
-                chunk['Kf'].isin([PARTICLE[name] for name in self.particle_filter_parallel]) &
-                chunk['e'].between(*self.energy_filter_parallel) &
-                chunk['x'].between(*self.x_filter_parallel) &
-                chunk['y'].between(*self.y_filter_parallel)
+                chunk['Kf'].isin([PARTICLE[name] for name in particle_f]) &
+                chunk['e'].between(*energy_f) &
+                chunk['x'].between(*x_f) &
+                chunk['y'].between(*y_f)
             ]
             yield chunk
 
@@ -480,7 +473,7 @@ class BrightifyModel:
         - particles: list or set or similar of particle names strings as e.g. ["neutron"]
         - energy, x, or y: something that has a minimum and maximum
         """
-        if not hasattr(self, "particle_parallel"):
+        if not hasattr(self, "particle_filter_parallel"):
             self.reset_filter_parallel()
         if particles:
             particles = set(particles).intersection(self.particle_filter_parallel)
@@ -552,21 +545,21 @@ class BrightifyModel:
         
         
         def calc_parallel(data_filt):
+            n = len(data_filt['Wt'])
+            Wt_sq_sum = fc.sum_f(data_filt['Wt']**2)
 
 
 
 
-            weights = data_filt['Wt']
-            Wt_sq_sum = fc.sum_f(weights**2)
-            return Wt_sq_sum, len(weights)
+            return Wt_sq_sum, n
         
         
         with ProcessPoolExecutor() as executor:
             results = list(executor.map(calc_parallel, data_filt_gen))
 
-        Wt_sq_sum = sum([r[0] for r in results])
-        total_len = sum([r[1] for r in results])
-        Am = Wt_sq_sum / total_len
+        total_Wt_sq_sum = sum([r[0] for r in results])
+        total_n = sum([r[1] for r in results])
+        total_Am = total_Wt_sq_sum / total_n # mean squared weight over all chunks/processes
 
 
 
@@ -796,6 +789,11 @@ class Spherical(BrightifyModel):
                                           shape2D=self.spiral.shape,
                                           slice_filter_func=self.spherical_filter_func,
                                           points=self.spiral)            
+
+
+    def calculate_parallel(self):
+        data_filt_gen = self.data_filter_parallel()
+
 
     @staticmethod
     def spiral_scan(spiral_points):
