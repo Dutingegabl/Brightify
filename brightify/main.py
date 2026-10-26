@@ -534,7 +534,7 @@ class BrightifyModel:
         
         return self.sigma / np.sqrt(self.window_weights)
 
-    def compute_sigma(self, slice_filt_i, sum_squared_weight, mean_squared_weight, window_weight):
+    def compute_sigma(self, slice_filt_i, Wt_sq_sum, Am, window_weight):
         """
         Compute the standard deviation (sigma) for a given filtered data slice.
         """
@@ -543,7 +543,7 @@ class BrightifyModel:
     
         # Compute sigma using precomputed values
         return np.sqrt(
-            np.abs(fc.sum_f(slice_filt_i['Wt']**2) / sum_squared_weight - mean_squared_weight * window_weight) /
+            np.abs(fc.sum_f(slice_filt_i['Wt']**2) / Wt_sq_sum - Am * window_weight) /
             (window_weight - 1)
         )
   
