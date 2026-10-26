@@ -11,6 +11,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import mcpl
 from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 
 from brightify import fast_computation as fc
 
@@ -369,6 +370,7 @@ class BrightifyModel:
             self.input_is_ascii = input_is_ascii
         self.data = read_data(inputFile=self.inputFile, input_is_ascii=self.input_is_ascii)
         self.parallel=False
+        print("Data is reset, it is recommended to reset the filter too.")
 
     def reset_data_parallel(self, inputFile=None, input_is_ascii=None, chunk_size=None):
         """
@@ -525,7 +527,8 @@ class BrightifyModel:
         
         return self.sigma / np.sqrt(self.window_weights)
 
-    def compute_sigma(self, slice_filt_i, Wt_sq_sum, Am, window_weight):
+    @staticmethod
+    def compute_sigma(slice_filt_i, Wt_sq_sum, Am, window_weight):
         """
         Compute the standard deviation (sigma) for a given filtered data slice.
         """
@@ -538,24 +541,77 @@ class BrightifyModel:
             (window_weight - 1)
         )
 
+    @staticmethod
+    def execute_parallel(func, *iterable_s, max_processes=4, **kwargs):
+        """
+        This distributes work done to individual elements from the iterable(s) to parallel processes.
+        Any singular arguments (which are the same for all iterations) are passed as extra keyword arguments.
+        
+        - func: function to execute each time. It must take as many parameters as there are iterables
+        - iterable_s: one or more iterables (separate by commas, no keywords)
+        - max_processes: maximum amount of concurrent processes
+        - **kwargs: extra parameters that are then the same value for each iteration/execution
+
+        Example: execute_parallel(my_func, list1, list2, max_processes=4, const_1=123, const_2=234, const_3=345)
+        """
+        configured_func = partial(func, **kwargs)
+        with ProcessPoolExecutor(max_workers=max_processes) as executor:
+            results = list(executor.map(configured_func, *iterable_s))
+        return results
+
 
     def calculate_properties_parallel(self, data_filt_gen, shape1D, shape2D, 
                              slice_filter_func, points, forced_direction=None):
 
-        
-        
-        def calc_parallel(data_filt):
-            n = len(data_filt['Wt'])
-            Wt_sq_sum = fc.sum_f(data_filt['Wt']**2)
+        def calc_parallel(data_filt, shape1D, shape2D, slice_filter_func, points, forced_direction):
+            this_n = len(data_filt['Wt'])
+            this_Wt_sq_sum = fc.sum_f(data_filt['Wt']**2)
+            
+            total_neutrons = np.full(shape1D, np.nan)
+            total_weights = np.full(shape1D, np.nan)
+            window_weights = np.full(shape1D, np.nan)
+            total_mean = np.full(shape1D, np.nan)
+            relative_error = np.full(shape1D, np.nan)
+            sigma = np.full(shape1D, np.nan)
+            mean_directions = np.full(shape2D, np.nan)
+            mean_directions_spher = np.full(shape2D, np.nan)
+            mean_directions_window = np.full(shape2D, np.nan)
+
+            for i, vec in enumerate(points):
+                slice_i = slice_filter_func(data_filt, vec)
+                if slice_i.empty:
+                    continue
+
+                self.total_neutrons[i] = len(slice_i)
+                self.total_weights[i] = fc.sum_f(slice_i.Wt)
+                self.total_mean[i] = np.mean(slice_i.Wt)
+
+                # Use forced direction if provided, else compute mean direction
+                if forced_direction is not None:
+                    direction_vec = forced_direction
+                else:
+                    direction_vec = fc.direction_f(fc.mean_f(slice_i[vel], slice_i.Wt))
+
+                self.mean_directions[i] = direction_vec
+                self.mean_directions_spher[i] = fc.cart2spher(*direction_vec)
+
+                # Apply angular filter
+                slice_filt_i = slice_i[fc.cos_f(slice_i[vel], direction_vec) >= self.dir_window]
+                self.window_weights[i] = fc.sum_f(slice_filt_i.Wt)
+
+                # Sigma and relative error
+                self.sigma[i] = self.compute_sigma(slice_filt_i, Wt_sq_sum, Am, self.window_weights[i])
+                self.relative_error[i] = self.r_err[i]
+
+                # Weighted direction
+                self.mean_directions_window[i] = direction_vec * self.window_weights[i]
+
+            return this_Wt_sq_sum, this_n        
 
 
-
-
-            return Wt_sq_sum, n
-        
-        
-        with ProcessPoolExecutor() as executor:
-            results = list(executor.map(calc_parallel, data_filt_gen))
+        results = self.execute_parallel(calc_parallel,
+                                        data_filt_gen,
+                                        shape1D=shape1D, shape2D=shape2D, slice_filter_func=slice_filter_func, points=points, forced_direction=forced_direction)
 
         total_Wt_sq_sum = sum([r[0] for r in results])
         total_n = sum([r[1] for r in results])
@@ -793,7 +849,13 @@ class Spherical(BrightifyModel):
 
     def calculate_parallel(self):
         data_filt_gen = self.data_filter_parallel()
+        self.pos_window = 1 - self.pos_size / (2 * np.pi * self.radius**2)  # Position window
+        self.dir_window = 1 - self.dir_size / (2 * np.pi)  # Direction window (d(omega) = dS/r^2)
 
+        return self.calculate_properties_parallel(data_filt_gen=data_filt_gen, shape1D=self.spiral.shape[0],
+                                          shape2D=self.spiral.shape,
+                                          slice_filter_func=self.spherical_filter_func,
+                                          points=self.spiral)
 
     @staticmethod
     def spiral_scan(spiral_points):
@@ -929,6 +991,27 @@ class Flat(BrightifyModel):
         self.vectors = np.stack((self.x_mesh.flatten(), self.y_mesh.flatten(),
                                  self.z_mesh.flatten()), axis=-1)
 
+
+    def prepare_vectors_parallel(self):
+        data_filt_gen = self.data_filter_parallel()
+
+        def x_and_y_min_and_max(data_filt):
+            return data_filt.x.min(), data_filt.x.max(), data_filt.y.min(), data_filt.y.max()
+
+        with ProcessPoolExecutor() as executor:
+            results = list(executor.map(x_and_y_min_and_max, data_filt_gen))
+        
+        self.x_min = min([r[0] for r in results])
+        self.x_max = max([r[1] for r in results])
+        self.y_min = min([r[2] for r in results])
+        self.y_max = max([r[3] for r in results])
+
+        self.x_range = np.arange(self.x_min, self.x_max + 1, self.pos_size_x/4)
+        self.y_range = np.arange(self.y_min, self.y_max + 1, self.pos_size_y/4)
+        self.x_mesh, self.y_mesh = np.meshgrid(self.x_range, self.y_range)
+        self.z_mesh = np.full_like(self.x_mesh, 1.)
+        self.vectors = np.stack((self.x_mesh.flatten(), self.y_mesh.flatten(), self.z_mesh.flatten()), axis=-1)
+    
     #------------------ Filter function ---------------------------#
     def flat_filter_func(self, data_filt, vec):
         return data_filt[(data_filt['x'] >= vec[0] - self.pos_size_x/2) & 
@@ -980,6 +1063,11 @@ class Flat(BrightifyModel):
         
         self.calc_method = method
         return result
+
+    def calculate_parallel(self, method="adaptive", bins_cart=35, threshold_frac=0.98):
+        self.dir_window = 1- self.dir_size
+
+
 
     #------------------ Unified plotting ------------------#
     def plot_brightness_map(self, method=None, show_arrows=True):
@@ -1159,3 +1247,4 @@ class Flat(BrightifyModel):
 
 
     
+
