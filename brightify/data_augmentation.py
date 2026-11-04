@@ -23,28 +23,32 @@ DEFAULT_ALIASES_LOWERCASE = {
     "userflags": ["userflags", "user", "flags", "flag", "usr", "f"]
 }
 
-def organize_data(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, atol=1e-8):
+def organize_data_for_mcpl(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, atol=1e-8, copy=False):
     """
-    Maps columns, checks for constant/zero values, and returns the organized data.
+    Maps column names to standard names for mcpl data, checks for constant/zero/missing columns, and returns the organized data.
     
     Parameters
     ----
-    - data: pandas DataFrame (e.g. created from a mcpl file)
+    - data: pandas DataFrame
     - col_map (optional): A dictionary explaining any uncommon column names in the input data.
     Most are automatically recognized, but you can specify here e.g. col_map = {"my_coord_x": "x", "my_coord_y": "y"}.
-    The values must be among the following standard names: "ekin", "pdgcode", "x", "y", "z", "ux", "uy", "uz", "weight", "time", "polx", "poly", "polz", "userflags"
+    The dictionary values must be among the following standard names: "ekin", "pdgcode", "x", "y", "z", "ux", "uy", "uz", "weight", "time", "polx", "poly", "polz", "userflags"
     Note that this allows you to swap columns, e.g. col_map = {"my_x":"y", "my_y":"x"}.
     - rtol and atol: relative and absolute tolerance parameters passed to np.isclose() in order to find almost-constant columns (see below).
+    - copy: Set True if you want the returned dictionary to contain copies of the dataframe columns instead of references to them.
 
     Returns
     ----
-    inv_col_map, constant_columns, variable_columns
+    inv_col_map, columns_len, columns_data
 
-    - inv_col_map: Dictionary with all standard column names as keys and the respective input columns' names as values.
-    - constant_columns: Dictionary of constant or not-found columns (with standard names as keys), e.g. {"weight": 1, "z":0.6, "time": 0, "polx": None}. 
-    Also contains almost-constant columns' mean values, calculated via np.isclose(column, np.mean(column), rtol=rtol, atol=atol).
-    NaN values are ignored in the calculations except when the entire column is NaN, then the constant yielded is None.
-    - variable_columns: Dictionary of numpy arrays for the remaining columns (with standard names as keys).
+    - inv_col_map: Dictionary with the standard column names as keys and the respective input columns' names as values.
+    - columns_len: Dictionary (with standard name keys) indicating for each column whether it is missing (0), constant (1), or variable (length of series).
+    - columns_data: Dictionary (with standard name keys) of the column data, can be a scalar number, a series (including NaN values), or None (depending on type).
+    
+    Note: "Almost"-constancy of columns is checked via np.isclose(column, np.mean(column), rtol=rtol, atol=atol).
+    If True, then the column is considered constant with the mean as the constant value.
+    NaN values are ignored in the calculations, unless the entire column is NaN, then the column will be considered a missing column. 
+    Variable columns are such that have least two different non-NaN values that are not close enough to pass the np.isclose() test.
     """
 
     # check inputs
@@ -77,28 +81,88 @@ def organize_data(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, atol=1e-8
                 raise ValueError("More than one column is matching the standard column name '"+std_name+"', namely: "+str(columns_matching))
 
     # build other outputs
-    constant_columns = {}
-    variable_columns = {}    
+    columns_len = {} 
+    columns_data = {}
     for std_name, col in inv_col_map.items():
         if col is None:
-            constant_columns[std_name] = None
+            columns_len[std_name] = 0
+            columns_data[std_name] = None
             continue
         else:
-            series = data[col]
+            series = data[col]  # might contain NaN values
             series_without_NaN = series.dropna()
             if len(series_without_NaN) == 0:
-                constant_columns[std_name] = None
+                columns_len[std_name] = 0
+                columns_data[std_name] = None
             elif series_without_NaN.nunique() == 1:
                 first = series_without_NaN.iloc[0]
-                constant_columns[std_name] = first
+                columns_len[std_name] = 1
+                columns_data[std_name] = first
             else:
                 mean = series_without_NaN.mean()
                 if np.all(np.isclose(series_without_NaN, mean, rtol=rtol, atol=atol)):
-                    constant_columns[std_name] = mean
+                    columns_len[std_name] = 1
+                    columns_data[std_name] = mean
                 else:
-                    variable_columns[std_name] = series.copy() # WITH the NaN values
+                    columns_len[std_name] = len(series)
+                    if copy:
+                        columns_data[std_name] = series.copy()
+                    else:
+                        columns_data[std_name] = series
 
-    all_columns = constant_columns | variable_columns # this is a shallow copy combining all keys (the values are references to the same objects as in the two individual dictionaries)
+    
+    return inv_col_map, columns_len, columns_data
+
+
+
+
+
+def write_organized_data_to_mcpl(file_path, columns_len, columns_data, double_prec=False, force=False):
+    """
+    Write output from the other method to a mcpl file using kdsource.
+    Missing (len = 0) columns will be set to default values: weight=1, pdgcode=2112 (neutron), all other=0,
+    except polx, poly, polz and userflags, which may be None.
+    Where needed, scalar values are converted to rows before being passed to the kds.write_mcpl() method.
+    """
+    columns_data = columns_data.copy() # makes a shallow copy and assigns it to local "columns_data" name
+    file_path = str(Path(file_path).absolute())
+    longest = max(columns_len.values())
+
+    for col in DEFAULT_ALIASES_LOWERCASE.keys():
+        col_len = columns_len[col]
+        # allowed scalar but not None: weight pdgcode
+        if col == "weight":
+            if col_len == 0:
+                columns_data[col] = 1
+        elif col == "pdgcode":
+            if col_len == 0:
+                columns_data[col] = 2112
+        # allowed None but not scalar: polx poly polz userflags
+        elif col in ("polx", "poly", "polz", "userflags"):
+            if col_len == 1: 
+                val = columns_data[col]
+                columns_data[col] = np.full(longest, val)
+        # all others:
+        else:
+            if col_len == 0:
+                columns_data[col] = np.zeros(longest)
+            elif col_len == 1:
+                val = columns_data[col]
+                columns_data[col] = np.full(longest, val)
+            else:
+                if not col_len == longest:
+                    raise ValueError("The column "+col+" was found to be shorter than the longest!")
+    kds.write_mcpl(filename=file_path, **columns_data, double_prec=double_prec, force=force)
+
+
+
+
+
+
+
+def normalize_vector_columns(data: pd.DataFrame):
+
+    # all_columns = constant_columns | variable_columns | missing_columns # this is a shallow copy combining all keys (the values are references to the same objects as in the two individual dictionaries)
 
     # # 3. Check normalization of direction vectors
     # ux, uy, uz = (all_columns[inv_col_map[c]] for c in ("ux", "uy", "uz"))
@@ -136,6 +200,8 @@ def find_geometry(inputs):
     """
     This attempts to find a kdsource geometry that suits the inputs
     """
+    # We must look at:
+    # 1. missing or constant columns
     return geometry
 
 
@@ -143,6 +209,11 @@ def augment_data(inputs):
     """
     Expands data using kdsource
     """
+    # 1. find geometry
+    # 2. construct model
+    # 3. fit model
+    # 4. resample to disk
+    # 5. read from disk and append to input data?
     return augmented_data
 
 
