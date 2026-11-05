@@ -1,11 +1,14 @@
+#%%
 import kdsource.api as kds
 import mcpl
 import pandas as pd
 from pathlib import Path
 import tempfile
 import numpy as np
-
-
+import sys
+import os
+import multiprocessing
+#%%
 DEFAULT_ALIASES_LOWERCASE = {
     "ekin": ["ekin", "e", "energy", "ekin_mev", "e_mev", "energy_mev", "mev"],
     "pdgcode": ["pdgcode", "pdg_code", "pdg", "pid", "p_id", "particle_id", "id", "particle", "kf"],
@@ -22,6 +25,101 @@ DEFAULT_ALIASES_LOWERCASE = {
     "polz": ["polz", "pol_z", "z_pol", "zpol"],
     "userflags": ["userflags", "user", "flags", "flag", "usr", "f"]
 }
+#%%
+def _worker_func(queue, log_file_name, func, **kwargs):
+    """Helper for process_func().
+    Runs func with kwargs in a separate process. If the func crashes, only this process dies.
+    - queue: multiprocessing Queue
+    - log_file_name: name of (temporary) file where to put the terminal output of func
+    - func: method to process with kwargs as parameters
+    - kwargs: parameters for func
+
+    Returns
+    --
+    - Output of func (if no crash). If crash, then an exception is raised carrying the stderr and stdout (if exist).
+    """
+    with open(log_file_name, 'w') as log_file:
+        sys.stderr.flush()
+        sys.stdout.flush()        
+        # Save original file descriptors so we can restore them later
+        orig_stderr = os.dup(2)
+        orig_stdout = os.dup(1)        
+        # Redirect OS-level stderr (2) and stdout (1) straight into our file
+        os.dup2(log_file.fileno(), 2)
+        os.dup2(log_file.fileno(), 1)
+    try:
+        result = func(**kwargs)
+        queue.put(("SUCCESS", result))
+    except Exception as e:
+        queue.put(("ERROR", str(e)))
+    finally:
+        sys.stderr.flush()
+        sys.stdout.flush()
+        os.dup2(orig_stderr, 2)
+        os.dup2(orig_stdout, 1)
+        os.close(orig_stderr)
+        os.close(orig_stdout)
+
+def process_func(func, **kwargs):
+    """
+    Run func with kwargs as parameters in a separate process,
+    to guard against python kernel crashes cause e.g. by calling C functions.
+    If func crashes, an Exception is raised that reveals the console output of func.
+    """
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.log') as log_file:
+        log_file_name = log_file.name
+    queue = multiprocessing.Queue()
+    p = multiprocessing.Process(target=_worker_func, args=(queue, log_file_name, func), kwargs=kwargs)
+    p.start()
+    p.join() # Wait for the process to finish
+
+    with open(log_file_name, 'r') as f:
+       log = f.read().strip()
+    # Check if the process crashed (exitcode != 0)
+    if p.exitcode != 0:
+        msg = f"The processing of 'func' crashed fatally (exit code {p.exitcode})."
+        if log:
+            msg += f"\n'func' log:\n{log}"
+        raise RuntimeError(msg)
+    if not queue.empty():
+        status, result = queue.get()
+        if status == "SUCCESS":
+            return result
+        else:
+            msg = f"Error: {result}"
+            if log:
+                msg += f"\n'func' log:\n{log}"
+            raise Exception(msg)
+    raise RuntimeError("Unknown failure.")
+
+def read_data(file_path, n=-1):
+    """
+    Read up to n particles from the mcpl file. n==-1 means read all.
+    """
+    blocklength = 10000
+    gen_file = mcpl.MCPLFile(file_path, blocklength=blocklength)
+    datas = []
+    for i, p in enumerate(gen_file.particle_blocks):
+        data = pd.DataFrame(
+            {
+                "e": p.ekin,  # Kinetic energy
+                "x": p.x,  # x-position
+                "y": p.y,  # y-position
+                "z": p.z,  # z-position
+                "Vx": p.ux,  # Velocity in x-direction
+                "Vy": p.uy,  # Velocity in y-direction
+                "Vz": p.uz,  # Velocity in z-direction
+                "Wt": p.weight,  # Weight of the particle
+                "Kf": p.pdgcode,  # Particle PDG code
+            }
+        )
+        datas.append(data)
+        if n != -1 and (i + 1) * blocklength >= n:
+            break
+    data = pd.concat(datas, ignore_index=True)
+    if n != -1 and len(data) > n:
+        data = data[:n]
+    return data
 
 def organize_data_for_mcpl(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, atol=1e-8, copy=False):
     """
@@ -35,16 +133,18 @@ def organize_data_for_mcpl(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, 
     The dictionary values must be among the following standard names: "ekin", "pdgcode", "x", "y", "z", "ux", "uy", "uz", "weight", "time", "polx", "poly", "polz", "userflags"
     Note that this allows you to swap columns, e.g. col_map = {"my_x":"y", "my_y":"x"}.
     - rtol and atol: relative and absolute tolerance parameters passed to np.isclose() in order to find almost-constant columns (see below).
-    - copy: Set True if you want the returned dictionary to contain copies of the dataframe columns instead of references to them.
+    - copy: Set True if you want the returned dictionary to contain copies of the dataframe columns instead of views/references of them.
 
     Returns
     ----
     inv_col_map, columns_len, columns_data
 
     - inv_col_map: Dictionary with the standard column names as keys and the respective input columns' names as values.
-    - columns_len: Dictionary (with standard name keys) indicating for each column whether it is missing (0), constant (1), or variable (length of series).
-    - columns_data: Dictionary (with standard name keys) of the column data, can be a scalar number, a series (including NaN values), or None (depending on type).
-    
+    - columns_len: Dictionary (with standard name keys) indicating for each column whether it is missing (0), constant (positive integer length of the column), or variable (negative integer column length).
+    The column length will of course be the length of the input data.
+    - columns_data: Dictionary (with standard name keys) of the column data, can be None (missing), or a scalar (constant) number, or a variable pandas series (including any NaN values).
+    The series are views on the dataframe columns, unless copy = True.
+
     Note: "Almost"-constancy of columns is checked via np.isclose(column, np.mean(column), rtol=rtol, atol=atol).
     If True, then the column is considered constant with the mean as the constant value.
     NaN values are ignored in the calculations, unless the entire column is NaN, then the column will be considered a missing column. 
@@ -83,6 +183,7 @@ def organize_data_for_mcpl(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, 
     # build other outputs
     columns_len = {} 
     columns_data = {}
+    len_data = len(data)
     for std_name, col in inv_col_map.items():
         if col is None:
             columns_len[std_name] = 0
@@ -92,30 +193,38 @@ def organize_data_for_mcpl(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, 
             series = data[col]  # might contain NaN values
             series_without_NaN = series.dropna()
             if len(series_without_NaN) == 0:
-                columns_len[std_name] = 0
-                columns_data[std_name] = None
+                columns_len[std_name] = 0 # zero -> missing column
+                columns_data[std_name] = None # None value
             elif series_without_NaN.nunique() == 1:
                 first = series_without_NaN.iloc[0]
-                columns_len[std_name] = 1
-                columns_data[std_name] = first
+                columns_len[std_name] = len_data # positive -> constant column
+                columns_data[std_name] = first # scalar value
             else:
                 mean = series_without_NaN.mean()
                 if np.all(np.isclose(series_without_NaN, mean, rtol=rtol, atol=atol)):
-                    columns_len[std_name] = 1
-                    columns_data[std_name] = mean
+                    columns_len[std_name] = len_data # positive -> constant column
+                    columns_data[std_name] = mean # scalar value
                 else:
-                    columns_len[std_name] = len(series)
+                    columns_len[std_name] = -len_data # negative -> variable column
                     if copy:
-                        columns_data[std_name] = series.copy()
+                        columns_data[std_name] = series.copy() # series value
                     else:
-                        columns_data[std_name] = series
-
+                        columns_data[std_name] = series # series value
     
     return inv_col_map, columns_len, columns_data
 
-
-
-
+#%%
+filename = "./test.mcpl.gz"
+data = read_data(filename)
+#%%
+inv_col_map, columns_len, columns_data = organize_data_for_mcpl(data)
+#%%
+print(inv_col_map)
+#%%
+print(columns_len)
+#%%
+print(columns_data)
+#%%
 
 def write_organized_data_to_mcpl(file_path, columns_len, columns_data, double_prec=False, force=False):
     """
@@ -124,40 +233,47 @@ def write_organized_data_to_mcpl(file_path, columns_len, columns_data, double_pr
     except polx, poly, polz and userflags, which may be None.
     Where needed, scalar values are converted to rows before being passed to the kds.write_mcpl() method.
     """
-    columns_data = columns_data.copy() # makes a shallow copy and assigns it to local "columns_data" name
+    assert len(columns_data) == len(columns_len) == len(DEFAULT_ALIASES_LOWERCASE)
+    write_data = columns_data.copy() # makes a shallow copy and assigns it to new local dictionary. it contains links to the same values (identical object references). reassigning of keys does not change those original values, nor the original dict.
     file_path = str(Path(file_path).absolute())
-    longest = max(columns_len.values())
-
-    for col in DEFAULT_ALIASES_LOWERCASE.keys():
-        col_len = columns_len[col]
+    abs_lens_set = set([abs(l) for l in columns_len.values()])
+    longest = max(abs_lens_set)
+    assert not longest == 0 # Longest column is zero length
+    assert not len(abs_lens_set) > 2 and not (len(abs_lens_set) == 2 and not 0 in abs_lens_set) # Some columns are different length
+    for col, col_len in columns_len.items():
         # allowed scalar but not None: weight pdgcode
-        if col == "weight":
-            if col_len == 0:
-                columns_data[col] = 1
-        elif col == "pdgcode":
-            if col_len == 0:
-                columns_data[col] = 2112
+        if col == "weight" and col_len == 0:
+            write_data[col] = 1 # default
+        elif col == "pdgcode" and col_len == 0:
+            write_data[col] = 2112 # default
         # allowed None but not scalar: polx poly polz userflags
         elif col in ("polx", "poly", "polz", "userflags"):
-            if col_len == 1: 
-                val = columns_data[col]
-                columns_data[col] = np.full(longest, val)
-        # all others:
+            if col_len > 0: # constant column
+                val = write_data[col]
+                write_data[col] = np.full(longest, val)
+            # other cases: col_len = 0 (None) is allowed as write parameter, col_len < 0 (variable series) is covered below.
+        # others:
         else:
-            if col_len == 0:
-                columns_data[col] = np.zeros(longest)
-            elif col_len == 1:
-                val = columns_data[col]
-                columns_data[col] = np.full(longest, val)
+            if col_len == 0: # missing column
+                write_data[col] = np.zeros(longest) # default
+            elif col_len > 0: # constant column
+                val = write_data[col]
+                write_data[col] = np.full(longest, val)
+            elif col_len < 0: # variable column
+                pass # write_data[col] already ok
             else:
-                if not col_len == longest:
-                    raise ValueError("The column "+col+" was found to be shorter than the longest!")
-    kds.write_mcpl(filename=file_path, **columns_data, double_prec=double_prec, force=force)
+                raise Exception("Impossible column length encountered.")
+    # call the write_mcpl method using the process_func wrapper to avoid kernel crash and see reasons for failure (e.g. bad columns, negative energy etc.)
+    process_func(kds.write_mcpl, filename=file_path, **write_data, double_prec=double_prec, force=force)
 
-
-
-
-
+#%%
+write_organized_data_to_mcpl("./again_test.mcpl.gz", columns_len=columns_len, columns_data=columns_data)
+#%%
+again_data = read_data("./again_test.mcpl.gz")
+again_data
+#%%
+data
+#%%
 
 
 def normalize_vector_columns(data: pd.DataFrame):
@@ -218,35 +334,7 @@ def augment_data(inputs):
 
 
 
-# def read_data(file_path, n=-1):
-#     """
-#     Read up to n particles from the mcpl file. n==-1 means read all.
-#     """
-#     blocklength = 10000
-#     gen_file = mcpl.MCPLFile(file_path, blocklength=blocklength)
-#     datas = []
-#     for i, p in enumerate(gen_file.particle_blocks):
-#         data = pd.DataFrame(
-#             {
-#                 "ekin": p.ekin,  # Kinetic energy
-#                 "x": p.x,  # x-position
-#                 "y": p.y,  # y-position
-#                 "z": p.z,  # z-position
-#                 "ux": p.ux,  # Velocity in x-direction
-#                 "uy": p.uy,  # Velocity in y-direction
-#                 "uz": p.uz,  # Velocity in z-direction
-#                 "time": p.time,
-#                 "weight": p.weight,  # Weight of the particle
-#                 "pdgcode": p.pdgcode,  # Particle PDG code
-#             }
-#         )
-#         datas.append(data)
-#         if n != -1 and (i + 1) * blocklength >= n:
-#             break
-#     data = pd.concat(datas, ignore_index=True)
-#     if n != -1 and len(data) > n:
-#         data = data[:n]
-#     return data
+
 
 # def resample_df(
 #     source,
