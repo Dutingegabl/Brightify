@@ -1,4 +1,9 @@
-#%%
+# This module allows the brightify user to:
+# 1. Check the statistics of his original input data, and if it's sufficient for the desired resolution of the brightify calculations.
+# 2. Find out the geometry of his data automatically, or specify it manually.
+# 3. Generate (resample) more "synthetic" data that is similar to the original input data, using kdsource, in order to increase the statistics.
+
+# ----- IMPORTS -----
 import kdsource.api as kds
 import mcpl
 import pandas as pd
@@ -8,8 +13,9 @@ import numpy as np
 import sys
 import os
 import multiprocessing
-#%%
-DEFAULT_ALIASES_LOWERCASE = {
+
+# ----- CONSTANTS -----
+COLUMN_ALIASES_LOWERCASE = {
     "ekin": ["ekin", "e", "energy", "ekin_mev", "e_mev", "energy_mev", "mev"],
     "pdgcode": ["pdgcode", "pdg_code", "pdg", "pid", "p_id", "particle_id", "id", "particle", "kf"],
     "x": ["x", "pos_x", "posx", "x_pos", "xpos"],
@@ -25,7 +31,8 @@ DEFAULT_ALIASES_LOWERCASE = {
     "polz": ["polz", "pol_z", "z_pol", "zpol"],
     "userflags": ["userflags", "user", "flags", "flag", "usr", "f"]
 }
-#%%
+
+# ----- GENERAL -----
 def _worker_func(queue, log_file_name, func, **kwargs):
     """Helper for process_func().
     Runs func with kwargs in a separate process. If the func crashes, only this process dies.
@@ -92,188 +99,188 @@ def process_func(func, **kwargs):
             raise Exception(msg)
     raise RuntimeError("Unknown failure.")
 
-def read_data(file_path, n=-1):
-    """
-    Read up to n particles from the mcpl file. n==-1 means read all.
-    """
-    blocklength = 10000
-    gen_file = mcpl.MCPLFile(file_path, blocklength=blocklength)
-    datas = []
-    for i, p in enumerate(gen_file.particle_blocks):
-        data = pd.DataFrame(
-            {
-                "e": p.ekin,  # Kinetic energy
+# ----- DATA I/O -----
+
+class OrganizedData:
+    def __init__(self, data: pd.DataFrame, col_map: dict = None, rtol=1e-5, atol=1e-8):
+        _, self.columns_len, self.columns_data = self.organize_data(data=data, col_map=col_map, rtol=rtol, atol=atol, copy=False)
+
+    @classmethod
+    def from_mcpl_file(cls, 
+                  file_path, n:int=-1, columns:set={"ekin","pdgcode","x","y","z","ux","uy","uz","weight","time","polx","poly","polz","userflags"},
+                  rtol=1e-5, atol=1e-8):
+        data = cls.read_data(file_path=file_path, n=n, columns=columns)
+        return cls(data=data, col_map=None, rtol=rtol, atol=atol)
+
+    @staticmethod
+    def read_data(file_path, n: int =-1, columns: set = {"ekin","pdgcode","x","y","z","ux","uy","uz","weight","time","polx","poly","polz","userflags"}):
+        """
+        Read up to n particles from the mcpl file into a pandas dataframe. n==-1 means read all.
+        Only the specified columns are read.
+        """
+        blocklength = 100000
+        gen_file = mcpl.MCPLFile(str(Path(file_path).absolute()), blocklength=blocklength)
+        datas = []
+        for i, p in enumerate(gen_file.particle_blocks):
+            mapping = {
+                "ekin": p.ekin,  # Kinetic energy
+                "pdgcode": p.pdgcode,  # Particle PDG code
                 "x": p.x,  # x-position
                 "y": p.y,  # y-position
                 "z": p.z,  # z-position
-                "Vx": p.ux,  # Velocity in x-direction
-                "Vy": p.uy,  # Velocity in y-direction
-                "Vz": p.uz,  # Velocity in z-direction
-                "Wt": p.weight,  # Weight of the particle
-                "Kf": p.pdgcode,  # Particle PDG code
-            }
-        )
-        datas.append(data)
-        if n != -1 and (i + 1) * blocklength >= n:
-            break
-    data = pd.concat(datas, ignore_index=True)
-    if n != -1 and len(data) > n:
-        data = data[:n]
-    return data
-
-def organize_data_for_mcpl(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, atol=1e-8, copy=False):
-    """
-    Maps column names to standard names for mcpl data, checks for constant/zero/missing columns, and returns the organized data.
+                "ux": p.ux,  # Velocity in x-direction
+                "uy": p.uy,  # Velocity in y-direction
+                "uz": p.uz,  # Velocity in z-direction
+                "weight": p.weight,  # Weight of the particle
+                "time": p.time,
+                "polx": p.polx,
+                "poly": p.poly,
+                "polz": p.polz,
+                "userflags": p.userflags,
+                }
+            data = pd.DataFrame({col:mapping[col] for col in columns if col in mapping.keys()})
+            datas.append(data)
+            if n != -1 and (i + 1) * blocklength >= n:
+                break
+        data = pd.concat(datas, ignore_index=True)
+        if n != -1 and len(data) > n:
+            data = data[:n]
+        return data
     
-    Parameters
-    ----
-    - data: pandas DataFrame
-    - col_map (optional): A dictionary explaining any uncommon column names in the input data.
-    Most are automatically recognized, but you can specify here e.g. col_map = {"my_coord_x": "x", "my_coord_y": "y"}.
-    The dictionary values must be among the following standard names: "ekin", "pdgcode", "x", "y", "z", "ux", "uy", "uz", "weight", "time", "polx", "poly", "polz", "userflags"
-    Note that this allows you to swap columns, e.g. col_map = {"my_x":"y", "my_y":"x"}.
-    - rtol and atol: relative and absolute tolerance parameters passed to np.isclose() in order to find almost-constant columns (see below).
-    - copy: Set True if you want the returned dictionary to contain copies of the dataframe columns instead of views/references of them.
+    @staticmethod
+    def organize_data(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, atol=1e-8, copy=False):
+        """
+        Maps column names to standard names for mcpl data, checks for constant/zero/missing columns, and returns the organized data.
+        
+        Parameters
+        ----
+        - data: pandas DataFrame
+        - col_map (optional): A dictionary explaining any uncommon column names in the input data.
+        Most are automatically recognized, but you can specify here e.g. col_map = {"my_coord_x": "x", "my_coord_y": "y"}.
+        The dictionary values must be among the following standard names: "ekin", "pdgcode", "x", "y", "z", "ux", "uy", "uz", "weight", "time", "polx", "poly", "polz", "userflags"
+        Note that this allows you to swap columns, e.g. col_map = {"my_x":"y", "my_y":"x"}.
+        - rtol and atol: relative and absolute tolerance parameters passed to np.isclose() in order to find almost-constant columns (see below).
+        - copy: Set True if you want the returned dictionary to contain copies of the dataframe columns instead of views/references of them.
 
-    Returns
-    ----
-    inv_col_map, columns_len, columns_data
+        Returns
+        ----
+        inv_col_map, columns_len, columns_data
 
-    - inv_col_map: Dictionary with the standard column names as keys and the respective input columns' names as values.
-    - columns_len: Dictionary (with standard name keys) indicating for each column whether it is missing (0), constant (positive integer length of the column), or variable (negative integer column length).
-    The column length will of course be the length of the input data.
-    - columns_data: Dictionary (with standard name keys) of the column data, can be None (missing), or a scalar (constant) number, or a variable pandas series (including any NaN values).
-    The series are views on the dataframe columns, unless copy = True.
+        - inv_col_map: Dictionary with the standard column names as keys and the respective input columns' names as values.
+        - columns_len: Dictionary (with standard name keys) indicating for each column whether it is missing (0), constant (positive integer length of the column), or variable (negative integer column length).
+        The column length will of course be the length of the input data.
+        - columns_data: Dictionary (with standard name keys) of the column data, can be None (missing), or a scalar (constant) number, or a variable pandas series (including any NaN values).
+        The series are views on the dataframe columns, unless copy = True.
 
-    Note: "Almost"-constancy of columns is checked via np.isclose(column, np.mean(column), rtol=rtol, atol=atol).
-    If True, then the column is considered constant with the mean as the constant value.
-    NaN values are ignored in the calculations, unless the entire column is NaN, then the column will be considered a missing column. 
-    Variable columns are such that have least two different non-NaN values that are not close enough to pass the np.isclose() test.
-    """
+        Note: "Almost"-constancy of columns is checked via np.isclose(column, np.mean(column), rtol=rtol, atol=atol).
+        If True, then the column is considered constant with the mean as the constant value.
+        NaN values are ignored in the calculations, unless the entire column is NaN, then the column will be considered a missing column. 
+        Variable columns are such that have least two different non-NaN values that are not close enough to pass the np.isclose() test.
+        """
 
-    # check inputs
-    if len(set(data.columns)) < len(data.columns):
-        raise ValueError("Input DataFrame must not have the same column name more than once")
-    col_map = col_map if col_map is not None else {}
-    for col,std_name in col_map.items():
-        if col not in data.columns:
-            raise ValueError("The key columns in col_map must exist in the data")
-        if std_name not in DEFAULT_ALIASES_LOWERCASE.keys():
-            raise ValueError("The value columns in col_map must be among the standard names")
-    if len(set(col_map.values())) < len(col_map.values()):
-        raise ValueError("No standard column name may be used more than once in the values of col_map")
+        # check inputs
+        if len(set(data.columns)) < len(data.columns):
+            raise ValueError("Input DataFrame must not have the same column name more than once")
+        col_map = col_map if col_map is not None else {}
+        for col,std_name in col_map.items():
+            if col not in data.columns:
+                raise ValueError("The key columns in col_map must exist in the data")
+            if std_name not in COLUMN_ALIASES_LOWERCASE.keys():
+                raise ValueError("The value columns in col_map must be among the standard names")
+        if len(set(col_map.values())) < len(col_map.values()):
+            raise ValueError("No standard column name may be used more than once in the values of col_map")
 
-    # build inv_col_map
-    inv_col_map = {std_name:col for col,std_name in col_map.items()}
-    for std_name, aliases in DEFAULT_ALIASES_LOWERCASE.items():
-        if std_name in inv_col_map.keys():
-            continue
-        else:
-            columns_matching = []
-            for col in data.columns:
-                if col.lower() in aliases:
-                    columns_matching.append(col)
-            if len(columns_matching) == 0:
-                inv_col_map[std_name] = None
-            elif len(columns_matching) == 1:
-                inv_col_map[std_name] = columns_matching[0]
+        # build inv_col_map
+        inv_col_map = {std_name:col for col,std_name in col_map.items()}
+        for std_name, aliases in COLUMN_ALIASES_LOWERCASE.items():
+            if std_name in inv_col_map.keys():
+                continue
             else:
-                raise ValueError("More than one column is matching the standard column name '"+std_name+"', namely: "+str(columns_matching))
-
-    # build other outputs
-    columns_len = {} 
-    columns_data = {}
-    len_data = len(data)
-    for std_name, col in inv_col_map.items():
-        if col is None:
-            columns_len[std_name] = 0
-            columns_data[std_name] = None
-            continue
-        else:
-            series = data[col]  # might contain NaN values
-            series_without_NaN = series.dropna()
-            if len(series_without_NaN) == 0:
-                columns_len[std_name] = 0 # zero -> missing column
-                columns_data[std_name] = None # None value
-            elif series_without_NaN.nunique() == 1:
-                first = series_without_NaN.iloc[0]
-                columns_len[std_name] = len_data # positive -> constant column
-                columns_data[std_name] = first # scalar value
-            else:
-                mean = series_without_NaN.mean()
-                if np.all(np.isclose(series_without_NaN, mean, rtol=rtol, atol=atol)):
-                    columns_len[std_name] = len_data # positive -> constant column
-                    columns_data[std_name] = mean # scalar value
+                columns_matching = []
+                for col in data.columns:
+                    if col.lower() in aliases:
+                        columns_matching.append(col)
+                if len(columns_matching) == 0:
+                    inv_col_map[std_name] = None
+                elif len(columns_matching) == 1:
+                    inv_col_map[std_name] = columns_matching[0]
                 else:
-                    columns_len[std_name] = -len_data # negative -> variable column
-                    if copy:
-                        columns_data[std_name] = series.copy() # series value
-                    else:
-                        columns_data[std_name] = series # series value
-    
-    return inv_col_map, columns_len, columns_data
+                    raise ValueError("More than one column is matching the standard column name '"+std_name+"', namely: "+str(columns_matching))
 
-#%%
-filename = "./test.mcpl.gz"
-data = read_data(filename)
-#%%
-inv_col_map, columns_len, columns_data = organize_data_for_mcpl(data)
-#%%
-print(inv_col_map)
-#%%
-print(columns_len)
-#%%
-print(columns_data)
-#%%
-
-def write_organized_data_to_mcpl(file_path, columns_len, columns_data, double_prec=False, force=False):
-    """
-    Write output from the other method to a mcpl file using kdsource.
-    Missing (len = 0) columns will be set to default values: weight=1, pdgcode=2112 (neutron), all other=0,
-    except polx, poly, polz and userflags, which may be None.
-    Where needed, scalar values are converted to rows before being passed to the kds.write_mcpl() method.
-    """
-    assert len(columns_data) == len(columns_len) == len(DEFAULT_ALIASES_LOWERCASE)
-    write_data = columns_data.copy() # makes a shallow copy and assigns it to new local dictionary. it contains links to the same values (identical object references). reassigning of keys does not change those original values, nor the original dict.
-    file_path = str(Path(file_path).absolute())
-    abs_lens_set = set([abs(l) for l in columns_len.values()])
-    longest = max(abs_lens_set)
-    assert not longest == 0 # Longest column is zero length
-    assert not len(abs_lens_set) > 2 and not (len(abs_lens_set) == 2 and not 0 in abs_lens_set) # Some columns are different length
-    for col, col_len in columns_len.items():
-        # allowed scalar but not None: weight pdgcode
-        if col == "weight" and col_len == 0:
-            write_data[col] = 1 # default
-        elif col == "pdgcode" and col_len == 0:
-            write_data[col] = 2112 # default
-        # allowed None but not scalar: polx poly polz userflags
-        elif col in ("polx", "poly", "polz", "userflags"):
-            if col_len > 0: # constant column
-                val = write_data[col]
-                write_data[col] = np.full(longest, val)
-            # other cases: col_len = 0 (None) is allowed as write parameter, col_len < 0 (variable series) is covered below.
-        # others:
-        else:
-            if col_len == 0: # missing column
-                write_data[col] = np.zeros(longest) # default
-            elif col_len > 0: # constant column
-                val = write_data[col]
-                write_data[col] = np.full(longest, val)
-            elif col_len < 0: # variable column
-                pass # write_data[col] already ok
+        # build other outputs
+        columns_len = {} 
+        columns_data = {}
+        len_data = len(data)
+        for std_name, col in inv_col_map.items():
+            if col is None:
+                columns_len[std_name] = 0
+                columns_data[std_name] = None
+                continue
             else:
-                raise Exception("Impossible column length encountered.")
-    # call the write_mcpl method using the process_func wrapper to avoid kernel crash and see reasons for failure (e.g. bad columns, negative energy etc.)
-    process_func(kds.write_mcpl, filename=file_path, **write_data, double_prec=double_prec, force=force)
+                series = data[col]  # might contain NaN values
+                series_without_NaN = series.dropna()
+                if len(series_without_NaN) == 0:
+                    columns_len[std_name] = 0 # zero -> missing column
+                    columns_data[std_name] = None # None value
+                elif series_without_NaN.nunique() == 1:
+                    first = series_without_NaN.iloc[0]
+                    columns_len[std_name] = len_data # positive -> constant column
+                    columns_data[std_name] = first # scalar value
+                else:
+                    mean = series_without_NaN.mean()
+                    if np.all(np.isclose(series_without_NaN, mean, rtol=rtol, atol=atol)):
+                        columns_len[std_name] = len_data # positive -> constant column
+                        columns_data[std_name] = mean # scalar value
+                    else:
+                        columns_len[std_name] = -len_data # negative -> variable column
+                        if copy:
+                            columns_data[std_name] = series.copy() # series value
+                        else:
+                            columns_data[std_name] = series # series value
+        
+        return inv_col_map, columns_len, columns_data
 
-#%%
-write_organized_data_to_mcpl("./again_test.mcpl.gz", columns_len=columns_len, columns_data=columns_data)
-#%%
-again_data = read_data("./again_test.mcpl.gz")
-again_data
-#%%
-data
-#%%
+    def write_to_mcpl(self, file_path, double_prec=False, force=False):
+        """
+        Write data to a mcpl file using kdsource.
+        Missing (len = 0) columns will be set to default values: weight=1, pdgcode=2112 (neutron), all other=0,
+        except polx, poly, polz and userflags, which may be None.
+        Where needed, scalar values are converted to rows before being passed to the kds.write_mcpl() method.
+        """
+        assert len(self.columns_len) == len(self.columns_data) == len(COLUMN_ALIASES_LOWERCASE)
+        write_data = self.columns_data.copy() # makes a shallow copy and assigns it to new local dictionary. it contains links to the same values (identical object references). reassigning of keys does not change those original values, nor the original dict.
+        file_path = str(Path(file_path).absolute())
+        abs_lens_set = set([abs(l) for l in self.columns_len.values()])
+        longest = max(abs_lens_set)
+        assert not longest == 0 # Longest column is zero length
+        assert not len(abs_lens_set) > 2 and not (len(abs_lens_set) == 2 and not 0 in abs_lens_set) # Some columns are different length
+        for col, col_len in self.columns_len.items():
+            # allowed scalar but not None: weight pdgcode
+            if col == "weight" and col_len == 0:
+                write_data[col] = 1 # default
+            elif col == "pdgcode" and col_len == 0:
+                write_data[col] = 2112 # default
+            # allowed None but not scalar: polx poly polz userflags
+            elif col in ("polx", "poly", "polz", "userflags"):
+                if col_len > 0: # constant column
+                    val = write_data[col]
+                    write_data[col] = np.full(longest, val)
+                # other cases: col_len = 0 (None) is allowed as write parameter, col_len < 0 (variable series) is covered below.
+            # others:
+            else:
+                if col_len == 0: # missing column
+                    write_data[col] = np.zeros(longest) # default
+                elif col_len > 0: # constant column
+                    val = write_data[col]
+                    write_data[col] = np.full(longest, val)
+                elif col_len < 0: # variable column
+                    pass # write_data[col] already ok
+                else:
+                    raise Exception("Impossible column length encountered.")
+        # call the write_mcpl method using the process_func wrapper to avoid kernel crash and see reasons for failure (e.g. bad columns, negative energy etc.)
+        process_func(kds.write_mcpl, filename=file_path, **write_data, double_prec=double_prec, force=force)
+
+# ----- DATA MUTATION -----
 
 
 def normalize_vector_columns(data: pd.DataFrame):
