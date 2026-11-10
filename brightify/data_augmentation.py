@@ -208,6 +208,36 @@ def organize_columns(data: pd.DataFrame, col_map=None, norm_dir=True, inplace=Tr
                 optimal_fill = mode_vals.iloc[0] if not mode_vals.empty else default_val
             target_df[std_name] = pd.arrays.SparseArray(series, fill_value=optimal_fill)
 
+    # Normalize direction vectors if requested
+    if norm_dir:            
+        # Convert to dense numpy arrays for calculation
+        ux = target_df['ux'].to_numpy(dtype=float)
+        uy = target_df['uy'].to_numpy(dtype=float)
+        uz = target_df['uz'].to_numpy(dtype=float)
+        # Calculate magnitude (norm)
+        norm = np.sqrt(ux**2 + uy**2 + uz**2)
+        # Check if all entries/columns are zero or missing (norm is 0 everywhere)
+        if np.all(norm == 0):
+            raise ValueError("Direction vectors (ux, uy, uz) are all missing or zero.")
+        # Avoid division by zero for any individual zero-vectors if necessary,
+        # or normalize where norm > 0
+        valid_mask = norm > 0
+        
+        # Initialize normalized arrays
+        norm_ux = np.zeros_like(ux)
+        norm_uy = np.zeros_like(uy)
+        norm_uz = np.zeros_like(uz)
+        
+        norm_ux[valid_mask] = ux[valid_mask] / norm[valid_mask]
+        norm_uy[valid_mask] = uy[valid_mask] / norm[valid_mask]
+        norm_uz[valid_mask] = uz[valid_mask] / norm[valid_mask]
+        
+        # Re-assign back to target_df as sparse arrays
+        target_df['ux'] = pd.arrays.SparseArray(norm_ux, fill_value=0.0)
+        target_df['uy'] = pd.arrays.SparseArray(norm_uy, fill_value=0.0)
+        target_df['uz'] = pd.arrays.SparseArray(norm_uz, fill_value=0.0)
+
+
     return target_df
 
 @staticmethod
@@ -223,30 +253,6 @@ def remove_na(data: pd.DataFrame, inplace=True, ignore_index=True):
         data.dropna(inplace=True, ignore_index=ignore_index)
     if len(data) == 0:
         print("Warning: The new dataframe is empty.")
-    return data
-
-def norm_direction(data: pd.DataFrame, inplace=True):
-    """
-    Calculates the norms of the direction (ux, uy, uz) vectors and prints the average, minimum, and maximum value.
-    - norm_dir: if True, the (ux, uy, uz) vectors will be normalized to magnitude 1.
-    - inplace: if True, the same dataframe object will be returned. Else, a copy.
-    Note: The returned data will contain all 3 direction columns (ux, uy, uz) if at least one component column exists (filling in default value 0 for missing components).
-    """
-    dir_cols = ["ux", "uy", "uz"]
-    dir_mag = np.sqrt(data["ux"]**2 + data["uy"]**2 + data["uz"]**2)
-    print(f"Direction vector magnitudes -> Min: {dir_mag.min():.4f}, Max: {dir_mag.max():.4f}, Mean: {dir_mag.mean():.4f}")
-    if np.allclose(dir_mag, 1.0):
-        print("Direction vectors are already normalized.")
-    else:
-        print("Direction vectors are not already normalized.")
-        if norm_dir:
-            # Prevent division by zero
-            safe_dir_mag = np.where(dir_mag == 0, 1.0, dir_mag)
-            data["ux"] = data["ux"] / safe_dir_mag
-            data["uy"] = data["uy"] / safe_dir_mag
-            data["uz"] = data["uz"] / safe_dir_mag
-            print("-> Direction vectors have been normalized to magnitude 1.")
-
     return data
 
 
