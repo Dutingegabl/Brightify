@@ -15,6 +15,24 @@ import os
 import multiprocessing
 
 # ----- CONSTANTS -----
+
+DEFAULT_VALUES = {
+    "ekin": 0.0,
+    "pdgcode": 2112, # neutron
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.0,
+    "ux": 0.0, # note that if all ux, uy and uz are zero, mcpl file cannot be written using kds
+    "uy": 0.0,
+    "uz": 0.0,
+    "weight": 1.0,
+    "time": 0.0,
+    "polx": None, # for polx, poly, polz and userflags, the mcpl writing function allows None value
+    "poly": None,
+    "polz": None,
+    "userflags": None,
+}
+
 COLUMN_ALIASES_LOWERCASE = {
     "ekin": ["ekin", "e", "energy", "ekin_mev", "e_mev", "energy_mev", "mev"],
     "pdgcode": ["pdgcode", "pdg_code", "pdg", "pid", "p_id", "particle_id", "id", "particle", "kf"],
@@ -101,372 +119,410 @@ def process_func(func, **kwargs):
 
 # ----- DATA I/O -----
 
-class OrganizedData:
+def organize_columns(data: pd.DataFrame, col_map=None, inplace=True):
+    """This renames columns to standard names using the COLUMN_ALIASES_LOWERCASE dictionary,
+    and drops columns whose names cannot be interpreted.
+    It also makes columns sparse, and uses the DEFAULT_VALUES as fill values if column was missing.
+
+    Parameters
+    ----
+    - data: pandas DataFrame
+    - col_map (optional): A dictionary explaining any uncommon column names in the input data.
+    Most are automatically recognized, but you can specify here e.g. col_map = {"my_coord_x": "x", "my_coord_y": "y"}.
+    The dictionary values must be among the following standard names: "ekin", "pdgcode", "x", "y", "z", "ux", "uy", "uz", "weight", "time", "polx", "poly", "polz", "userflags"
+    Note that this allows you to swap columns, e.g. col_map = {"my_x":"y", "my_y":"x"}.
+
+    Returns
+    ----
+    DataFrame
     """
-    This class holds data in a reduced form:
-    - self.columns_len: 0 for missing columns, positive integer for constant columns, negative (of the positive length) integer for variable columns.
-    - self.columns_data: None for missing columns, Scalar number for constant columns, pandas Series for variable columns.
-    The constructor has parameters for setting the tolerances for the testing of whether columns are (almost) constant.
-    The from_mcpl_file method constructs from a mcpl file, the standard constructor constructs from a pandas dataframe.
-    There is a method 'write_to_mcpl' that writes a mcpl file.
+    # check columns validity
+    if len(set(data.columns)) < len(data.columns):
+        raise ValueError("Input DataFrame must not have the same column name more than once")
+    col_map = col_map if col_map is not None else {}
+    for col,std_name in col_map.items():
+        if col not in data.columns:
+            raise ValueError("The key columns in col_map must exist in the data")
+        if std_name not in COLUMN_ALIASES_LOWERCASE.keys():
+            raise ValueError("The value columns in col_map must be among the standard names")
+    if len(set(col_map.values())) < len(col_map.values()):
+        raise ValueError("No standard column name may be used more than once in the values of col_map")
+
+    # build inv_col_map
+    inv_col_map = {std_name:col for col,std_name in col_map.items()}
+    for std_name, aliases in COLUMN_ALIASES_LOWERCASE.items():
+        if std_name in inv_col_map.keys():
+            continue
+        else:
+            columns_matching = []
+            for col in data.columns:
+                if col.lower() in aliases:
+                    columns_matching.append(col)
+            if len(columns_matching) == 0:
+                inv_col_map[std_name] = None
+            elif len(columns_matching) == 1:
+                inv_col_map[std_name] = columns_matching[0]
+            else:
+                raise ValueError("More than one column is matching the standard column name '"+std_name+"', namely: "+str(columns_matching))
+
+    # initialize dataframe to be returned
+    matched_orig_cols = {orig for orig in inv_col_map.values() if orig is not None}
+    if inplace:
+        # 1. Drop unwanted columns immediately to free memory
+        unwanted_cols = [c for c in data.columns if c not in matched_orig_cols]
+        if unwanted_cols:
+            data.drop(columns=unwanted_cols, inplace=True, errors='ignore')
+        # 2. Rename existing matched columns to their standard names right away
+        rename_map = {orig: std for std, orig in inv_col_map.items() if orig is not None and orig != std}
+        if rename_map:
+            data.rename(columns=rename_map, inplace=True)            
+        target_df = data
+    else:
+        # If not inplace, start with an empty DataFrame with the correct index
+        target_df = pd.DataFrame(index=data.index)
+
+    # Process column-by-column: sparsify and assign
+    for std_name, default_val in DEFAULT_VALUES.items():
+        # 1. Fetch source series
+        if inplace:
+            series = target_df.get(std_name) # returns None if column not existing
+        else:
+            orig_col = inv_col_map[std_name]
+            series = data.get(orig_col) if orig_col is not None else None
+        # 2. Apply rules based on column presence and contents
+        if series is None:
+            # Rule 1: Missing column -> Populate with DEFAULT_VALUES[std_name]
+            missing_series = pd.Series(default_val, index=target_df.index)
+            target_df[std_name] = pd.arrays.SparseArray(missing_series, fill_value=default_val)
+        elif series.dropna().empty:
+            # Rule 2: Present, but all NaNs/nulls -> Make sparse using NaN as the fill value
+            target_df[std_name] = pd.arrays.SparseArray(series, fill_value=float('nan'))
+        else:
+            # Rule 3: Present with valid data -> Optimal fill value (constant or mode)
+            if series.nunique() == 1:
+                optimal_fill = series.iloc[0]
+            else:
+                mode_vals = series.mode(dropna=False)
+                optimal_fill = mode_vals.iloc[0] if not mode_vals.empty else default_val
+            target_df[std_name] = pd.arrays.SparseArray(series, fill_value=optimal_fill)
+
+    return target_df
+
+
+
+
+
+@staticmethod
+def remove_na(data: pd.DataFrame, inplace=True, ignore_index=True):
     """
-
-    # ---- Constructor and helpers: ----
-
-    def __init__(self, data: pd.DataFrame, col_map: dict = None, rtol=1e-5, atol=1e-8):
-        data = self.remove_na(data=data, inplace=True, ignore_index=True)
-        data = self.norm_direction(data=data, norm_dir=True, inplace=True)
-        _, self.columns_len, self.columns_data = self.organize_data(data=data, col_map=col_map, rtol=rtol, atol=atol, copy=False)
-
-    @staticmethod
-    def remove_na(data: pd.DataFrame, inplace=True, ignore_index=True):
-        """
-        Returns data with rows (not columns) removed that have one (or more) "na" (not assigned/empty/NaN) values, using pandas dropna() method.
-        - inplace: Set to True to manipulate the input dataframe object instead of obtaining a copy.
-        - ignore_index: Set True if you want the returned data to have a fresh index starting at 0, instead of keeping the index numbers as before (with the removed rows missing). 
-        """
-        if inplace==True:
-            data = data.copy()
+    Returns data with rows (not columns) removed that have one (or more) "na" (not assigned/empty/NaN) values, using pandas dropna() method.
+    - inplace: Set to True to manipulate the input dataframe object instead of obtaining a copy.
+    - ignore_index: Set True if you want the returned data to have a fresh index starting at 0, instead of keeping the index numbers as before (with the removed rows missing). 
+    """
+    if not inplace:
+        data = data.dropna(inplace=False, ignore_index=ignore_index)
+    else:
         data.dropna(inplace=True, ignore_index=ignore_index)
-        if len(data) == 0:
-            print("Warning: The new dataframe is empty.")
-        return data
+    if len(data) == 0:
+        print("Warning: The new dataframe is empty.")
+    return data
 
-    @staticmethod
-    def norm_direction(data: pd.DataFrame, norm_dir=True, inplace=True):
-        """
-        Calculates the norms of the direction (ux, uy, uz) vectors and prints the average, minimum, and maximum value.
-        - norm_dir: if True, the (ux, uy, uz) vectors will be normalized to magnitude 1.
-        - inplace: if True, the same dataframe object will be returned. Else, a copy.
-        Note: The returned data will contain all 3 direction columns (ux, uy, uz) if at least one component column exists (filling in default value 0 for missing components).
-        """
-        # If inplace is False, work on a copy to avoid mutating the original dataframe
-        if not inplace:
-            data = data.copy()        
+def norm_direction(self, inplace=True):
+    """
+    Calculates the norms of the direction (ux, uy, uz) vectors and prints the average, minimum, and maximum value.
+    - norm_dir: if True, the (ux, uy, uz) vectors will be normalized to magnitude 1.
+    - inplace: if True, the same dataframe object will be returned. Else, a copy.
+    Note: The returned data will contain all 3 direction columns (ux, uy, uz) if at least one component column exists (filling in default value 0 for missing components).
+    """
 
-        # --- 1. Direction Vectors (ux, uy, uz) ---
-        dir_cols = ["ux", "uy", "uz"]
-        if any(col in data.columns for col in dir_cols):
-            # Ensure all 3 columns exist if at least one is present
-            for col in dir_cols:
-                if col not in data.columns:
-                    data[col] = 0.0
-            dir_mag = np.sqrt(data["ux"]**2 + data["uy"]**2 + data["uz"]**2)
-            print(f"Direction vector magnitudes -> Min: {dir_mag.min():.4f}, Max: {dir_mag.max():.4f}, Mean: {dir_mag.mean():.4f}")
-            if np.allclose(dir_mag, 1.0):
-                print("Direction vectors are already normalized.")
+    dir_cols = ["ux", "uy", "uz"]
+        dir_mag = np.sqrt(data["ux"]**2 + data["uy"]**2 + data["uz"]**2)
+        print(f"Direction vector magnitudes -> Min: {dir_mag.min():.4f}, Max: {dir_mag.max():.4f}, Mean: {dir_mag.mean():.4f}")
+        if np.allclose(dir_mag, 1.0):
+            print("Direction vectors are already normalized.")
+        else:
+            print("Direction vectors are not already normalized.")
+            if norm_dir:
+                # Prevent division by zero
+                safe_dir_mag = np.where(dir_mag == 0, 1.0, dir_mag)
+                data["ux"] = data["ux"] / safe_dir_mag
+                data["uy"] = data["uy"] / safe_dir_mag
+                data["uz"] = data["uz"] / safe_dir_mag
+                print("-> Direction vectors have been normalized to magnitude 1.")
+
+    return data
+
+
+@staticmethod
+def organize_data(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, atol=1e-8, copy=False):
+    """
+    Maps column names to standard names for mcpl data, checks for constant/zero/missing columns, and returns the organized data.
+    
+   
+    - rtol and atol: relative and absolute tolerance parameters passed to np.isclose() in order to find almost-constant columns (see below).
+    - copy: Set True if you want the returned dictionary to contain copies of the dataframe columns instead of views/references of them.
+
+    Returns
+    ----
+    inv_col_map, columns_len, columns_data
+
+    - inv_col_map: Dictionary with the standard column names as keys and the respective input columns' names as values.
+    - columns_len: Dictionary (with standard name keys) indicating for each column whether it is missing (0), constant (positive integer length of the column), or variable (negative integer column length).
+    The column length will of course be the length of the input data.
+    - columns_data: Dictionary (with standard name keys) of the column data, can be None (missing), or a scalar (constant) number, or a variable pandas series.
+    The series are views on the dataframe columns, unless copy = True.
+
+    Note: "Almost"-constancy of columns is checked via np.isclose(column, np.mean(column), rtol=rtol, atol=atol).
+    If True, then the column is considered constant with the mean as the constant value.
+
+    Note: The method does not handle NaN values in the dataframe. Better remove them beforehand using remove_na() method.
+    """
+
+    # check inputs
+    
+
+    
+
+    # build other outputs
+    columns_len = {} 
+    columns_data = {}
+    len_data = len(data)
+    for std_name, col in inv_col_map.items():
+        if col is None:
+            columns_len[std_name] = 0
+            columns_data[std_name] = None
+            continue
+        else:
+            series = data[col]
+            if len(series) == 0:
+                columns_len[std_name] = 0 # zero -> missing column
+                columns_data[std_name] = None # None value
+            elif series.nunique() == 1:
+                first = series.iloc[0]
+                columns_len[std_name] = len_data # positive -> constant column
+                columns_data[std_name] = first # scalar value
             else:
-                print("Direction vectors are not already normalized.")
-                if norm_dir:
-                    # Prevent division by zero
-                    safe_dir_mag = np.where(dir_mag == 0, 1.0, dir_mag)
-                    data["ux"] = data["ux"] / safe_dir_mag
-                    data["uy"] = data["uy"] / safe_dir_mag
-                    data["uz"] = data["uz"] / safe_dir_mag
-                    print("-> Direction vectors have been normalized to magnitude 1.")
-
-        return data
-
-    @staticmethod
-    def organize_data(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, atol=1e-8, copy=False):
-        """
-        Maps column names to standard names for mcpl data, checks for constant/zero/missing columns, and returns the organized data.
-        
-        Parameters
-        ----
-        - data: pandas DataFrame
-        - col_map (optional): A dictionary explaining any uncommon column names in the input data.
-        Most are automatically recognized, but you can specify here e.g. col_map = {"my_coord_x": "x", "my_coord_y": "y"}.
-        The dictionary values must be among the following standard names: "ekin", "pdgcode", "x", "y", "z", "ux", "uy", "uz", "weight", "time", "polx", "poly", "polz", "userflags"
-        Note that this allows you to swap columns, e.g. col_map = {"my_x":"y", "my_y":"x"}.
-        - rtol and atol: relative and absolute tolerance parameters passed to np.isclose() in order to find almost-constant columns (see below).
-        - copy: Set True if you want the returned dictionary to contain copies of the dataframe columns instead of views/references of them.
-
-        Returns
-        ----
-        inv_col_map, columns_len, columns_data
-
-        - inv_col_map: Dictionary with the standard column names as keys and the respective input columns' names as values.
-        - columns_len: Dictionary (with standard name keys) indicating for each column whether it is missing (0), constant (positive integer length of the column), or variable (negative integer column length).
-        The column length will of course be the length of the input data.
-        - columns_data: Dictionary (with standard name keys) of the column data, can be None (missing), or a scalar (constant) number, or a variable pandas series.
-        The series are views on the dataframe columns, unless copy = True.
-
-        Note: "Almost"-constancy of columns is checked via np.isclose(column, np.mean(column), rtol=rtol, atol=atol).
-        If True, then the column is considered constant with the mean as the constant value.
-
-        Note: The method does not handle NaN values in the dataframe. Better remove them beforehand using remove_na() method.
-        """
-
-        # check inputs
-        if len(set(data.columns)) < len(data.columns):
-            raise ValueError("Input DataFrame must not have the same column name more than once")
-        col_map = col_map if col_map is not None else {}
-        for col,std_name in col_map.items():
-            if col not in data.columns:
-                raise ValueError("The key columns in col_map must exist in the data")
-            if std_name not in COLUMN_ALIASES_LOWERCASE.keys():
-                raise ValueError("The value columns in col_map must be among the standard names")
-        if len(set(col_map.values())) < len(col_map.values()):
-            raise ValueError("No standard column name may be used more than once in the values of col_map")
-
-        # build inv_col_map
-        inv_col_map = {std_name:col for col,std_name in col_map.items()}
-        for std_name, aliases in COLUMN_ALIASES_LOWERCASE.items():
-            if std_name in inv_col_map.keys():
-                continue
-            else:
-                columns_matching = []
-                for col in data.columns:
-                    if col.lower() in aliases:
-                        columns_matching.append(col)
-                if len(columns_matching) == 0:
-                    inv_col_map[std_name] = None
-                elif len(columns_matching) == 1:
-                    inv_col_map[std_name] = columns_matching[0]
-                else:
-                    raise ValueError("More than one column is matching the standard column name '"+std_name+"', namely: "+str(columns_matching))
-
-        # build other outputs
-        columns_len = {} 
-        columns_data = {}
-        len_data = len(data)
-        for std_name, col in inv_col_map.items():
-            if col is None:
-                columns_len[std_name] = 0
-                columns_data[std_name] = None
-                continue
-            else:
-                series = data[col]
-                if len(series) == 0:
-                    columns_len[std_name] = 0 # zero -> missing column
-                    columns_data[std_name] = None # None value
-                elif series.nunique() == 1:
-                    first = series.iloc[0]
+                mean = series.mean()
+                if np.all(np.isclose(series, mean, rtol=rtol, atol=atol)):
                     columns_len[std_name] = len_data # positive -> constant column
-                    columns_data[std_name] = first # scalar value
+                    columns_data[std_name] = mean # scalar value
                 else:
-                    mean = series.mean()
-                    if np.all(np.isclose(series, mean, rtol=rtol, atol=atol)):
-                        columns_len[std_name] = len_data # positive -> constant column
-                        columns_data[std_name] = mean # scalar value
+                    columns_len[std_name] = -len_data # negative -> variable column
+                    if copy:
+                        columns_data[std_name] = series.copy() # series value
                     else:
-                        columns_len[std_name] = -len_data # negative -> variable column
-                        if copy:
-                            columns_data[std_name] = series.copy() # series value
-                        else:
-                            columns_data[std_name] = series # series value
-        
-        return inv_col_map, columns_len, columns_data
+                        columns_data[std_name] = series # series value
+    
+    return inv_col_map, columns_len, columns_data
 
-    # ---- Alternative constructor and helper: (use via OrganizedData.from_mcpl_file()) ----
+# ---- Alternative constructor and helper: (use via OrganizedData.from_mcpl_file()) ----
 
-    @classmethod
-    def from_mcpl_file(cls, 
-                  file_path, n:int=-1, columns:set={"ekin","pdgcode","x","y","z","ux","uy","uz","weight","time","polx","poly","polz","userflags"},
-                  rtol=1e-5, atol=1e-8):
-        data = cls.read_data(file_path=file_path, n=n, columns=columns)
-        return cls(data=data, col_map=None, rtol=rtol, atol=atol)
+@classmethod
+def from_mcpl_file(cls, 
+                file_path, n:int=-1, columns:set={"ekin","pdgcode","x","y","z","ux","uy","uz","weight","time","polx","poly","polz","userflags"},
+                rtol=1e-5, atol=1e-8):
+    data = cls.read_data(file_path=file_path, n=n, columns=columns)
+    return cls(data=data, col_map=None, rtol=rtol, atol=atol, inplace=True)
 
-    @staticmethod
-    def read_data(file_path, n: int =-1, columns: set = {"ekin","pdgcode","x","y","z","ux","uy","uz","weight","time","polx","poly","polz","userflags"}):
-        """
-        Read up to n particles from the mcpl file into a pandas dataframe. n==-1 means read all.
-        Only the specified columns are read.
-        """
-        blocklength = 100000
-        gen_file = mcpl.MCPLFile(str(Path(file_path).absolute()), blocklength=blocklength)
-        datas = []
-        for i, p in enumerate(gen_file.particle_blocks):
-            mapping = {
-                "ekin": p.ekin,  # Kinetic energy
-                "pdgcode": p.pdgcode,  # Particle PDG code
-                "x": p.x,  # x-position
-                "y": p.y,  # y-position
-                "z": p.z,  # z-position
-                "ux": p.ux,  # Velocity in x-direction
-                "uy": p.uy,  # Velocity in y-direction
-                "uz": p.uz,  # Velocity in z-direction
-                "weight": p.weight,  # Weight of the particle
-                "time": p.time,
-                "polx": p.polx,
-                "poly": p.poly,
-                "polz": p.polz,
-                "userflags": p.userflags,
-                }
-            data = pd.DataFrame({col:mapping[col] for col in columns if col in mapping.keys()})
-            datas.append(data)
-            if n != -1 and (i + 1) * blocklength >= n:
-                break
-        data = pd.concat(datas, ignore_index=True)
-        if n != -1 and len(data) > n:
-            data = data[:n]
-        return data
+@staticmethod
+def read_data(file_path, n: int =-1, columns: set = {"ekin","pdgcode","x","y","z","ux","uy","uz","weight","time","polx","poly","polz","userflags"}):
+    """
+    Read up to n particles from the mcpl file into a pandas dataframe. n==-1 means read all.
+    Only the specified columns are read.
+    """
+    blocklength = 100000
+    gen_file = mcpl.MCPLFile(str(Path(file_path).absolute()), blocklength=blocklength)
+    datas = []
+    for i, p in enumerate(gen_file.particle_blocks):
+        mapping = {
+            "ekin": p.ekin,  # Kinetic energy
+            "pdgcode": p.pdgcode,  # Particle PDG code
+            "x": p.x,  # x-position
+            "y": p.y,  # y-position
+            "z": p.z,  # z-position
+            "ux": p.ux,  # Velocity in x-direction
+            "uy": p.uy,  # Velocity in y-direction
+            "uz": p.uz,  # Velocity in z-direction
+            "weight": p.weight,  # Weight of the particle
+            "time": p.time,
+            "polx": p.polx,
+            "poly": p.poly,
+            "polz": p.polz,
+            "userflags": p.userflags,
+            }
+        data = pd.DataFrame({col:mapping[col] for col in columns if col in mapping.keys()})
+        datas.append(data)
+        if n != -1 and (i + 1) * blocklength >= n:
+            break
+    data = pd.concat(datas, ignore_index=True)
+    if n != -1 and len(data) > n:
+        data = data[:n]
+    return data
 
-    # ---- Write to mcpl method ----
+# ---- Write to mcpl method ----
 
-    def write_to_mcpl(self, file_path, double_prec=False, force=False):
-        """
-        Write data to a mcpl file using kdsource.
-        Missing (len = 0) columns will be set to default values: weight=1, pdgcode=2112 (neutron), all other=0,
-        except polx, poly, polz and userflags, which may be set to None in the mcpl file format.
-        Where needed, scalar values are converted to rows before being passed to the kds.write_mcpl() method.
-        """
-        assert len(self.columns_len) == len(self.columns_data) == len(COLUMN_ALIASES_LOWERCASE)
-        write_data = self.columns_data.copy() # makes a shallow copy and assigns it to new local dictionary. it contains links to the same values (identical object references). reassigning of keys does not change those original values, nor the original dict.
-        file_path = str(Path(file_path).absolute())
-        abs_lens_set = set([abs(l) for l in self.columns_len.values()])
-        longest = max(abs_lens_set)
-        assert not longest == 0 # Longest column is zero length
-        assert not len(abs_lens_set) > 2 and not (len(abs_lens_set) == 2 and not 0 in abs_lens_set) # Some columns are different length
-        for col, col_len in self.columns_len.items():
-            # allowed scalar but not None: weight pdgcode
-            if col == "weight" and col_len == 0:
-                write_data[col] = 1 # default
-            elif col == "pdgcode" and col_len == 0:
-                write_data[col] = 2112 # default
-            # allowed None but not scalar: polx poly polz userflags
-            elif col in ("polx", "poly", "polz", "userflags"):
-                if col_len > 0: # constant column
-                    val = write_data[col]
-                    write_data[col] = np.full(longest, val)
-                # other cases: col_len = 0 (None) is allowed as write parameter, col_len < 0 (variable series) is covered below.
-            # others:
+def write_to_mcpl(self, file_path, double_prec=False, force=False):
+    """
+    Write data to a mcpl file using kdsource.
+    Missing (len = 0) columns will be set to default values: weight=1, pdgcode=2112 (neutron), all other=0,
+    except polx, poly, polz and userflags, which may be set to None in the mcpl file format.
+    Where needed, scalar values are converted to rows before being passed to the kds.write_mcpl() method.
+    """
+    assert len(self.columns_len) == len(self.columns_data) == len(COLUMN_ALIASES_LOWERCASE)
+    write_data = self.columns_data.copy() # makes a shallow copy and assigns it to new local dictionary. it contains links to the same values (identical object references). reassigning of keys does not change those original values, nor the original dict.
+    file_path = str(Path(file_path).absolute())
+    abs_lens_set = set([abs(l) for l in self.columns_len.values()])
+    longest = max(abs_lens_set)
+    assert not longest == 0 # Longest column is zero length
+    assert not len(abs_lens_set) > 2 and not (len(abs_lens_set) == 2 and not 0 in abs_lens_set) # Some columns are different length
+    for col, col_len in self.columns_len.items():
+        # allowed scalar but not None: weight pdgcode
+        if col == "weight" and col_len == 0:
+            write_data[col] = 1 # default
+        elif col == "pdgcode" and col_len == 0:
+            write_data[col] = 2112 # default
+        # allowed None but not scalar: polx poly polz userflags
+        elif col in ("polx", "poly", "polz", "userflags"):
+            if col_len > 0: # constant column
+                val = write_data[col]
+                write_data[col] = np.full(longest, val)
+            # other cases: col_len = 0 (None) is allowed as write parameter, col_len < 0 (variable series) is covered below.
+        # others:
+        else:
+            if col_len == 0: # missing column
+                write_data[col] = np.zeros(longest) # default
+            elif col_len > 0: # constant column
+                val = write_data[col]
+                write_data[col] = np.full(longest, val)
+            elif col_len < 0: # variable column
+                pass # write_data[col] already ok
             else:
-                if col_len == 0: # missing column
-                    write_data[col] = np.zeros(longest) # default
-                elif col_len > 0: # constant column
-                    val = write_data[col]
-                    write_data[col] = np.full(longest, val)
-                elif col_len < 0: # variable column
-                    pass # write_data[col] already ok
-                else:
-                    raise Exception("Impossible column length encountered.")
-        # call the write_mcpl method using the process_func wrapper to avoid kernel crash and see reasons for failure (e.g. bad columns, negative energy etc.)
-        process_func(kds.write_mcpl, filename=file_path, **write_data, double_prec=double_prec, force=force)
+                raise Exception("Impossible column length encountered.")
+    # call the write_mcpl method using the process_func wrapper to avoid kernel crash and see reasons for failure (e.g. bad columns, negative energy etc.)
+    process_func(kds.write_mcpl, filename=file_path, **write_data, double_prec=double_prec, force=force)
 
-    # ---- Check statistics ----
+# ---- Check statistics ----
 
-    def check_statistics(self, resolution):
-        """
-        Analyze the data and return a value between 0 and 1 that indicates how good the statistics is for the desired resolution.
-        """
-        return
+def check_statistics(self, resolution):
+    """
+    Analyze the data and return a value between 0 and 1 that indicates how good the statistics is for the desired resolution.
+    """
+    return
 
-    # ---- Find geometry ----
+# ---- Find geometry ----
 
-    def find_geometry(self):
-        """
-        This attempts to find a kdsource geometry that suits the inputs.
-        NOTE: If a position or direction coordinate is missing (self.column_len[coordinate] is 0), then it is filled with default value 0.0 !
-        """
-        # We must look at:
-        # 1. missing or constant columns
-        # 2. 
+def find_geometry(self):
+    """
+    This attempts to find a kdsource geometry that suits the inputs.
+    NOTE: If a position or direction coordinate is missing (self.column_len[coordinate] is 0), then it is filled with default value 0.0 !
+    """
+    # We must look at:
+    # 1. missing or constant columns
+    # 2. 
+    
+    # constructor for Geometry
+    # kds.Geometry(metrics=, rot=, trasl=)
+    # available metrics (to be put into the kds.Geometry() constructor)
+    # kds.geom._metrics
+    # available pre-built geometries:
+    #  kds.geom.GeomFlat, kds.geom.GeomFlatTemp, kds.geom.GeomGuide, kds.geom.GeomActiv
+    
+    metrics = {}
+    constants = {} # for e.g. E0 value
+    
+    # --- 1. Energy Metric ---
+    # Only include if variable (< 0)
+    if self.columns_len['ekin'] < 0:
+        # Default to Energy; could check units or distribution for Lethargy / Wavelength
+        metrics['energy'] = "Energy"
+    # If constant (>0) or missing (0), energy metric is left out entirely to speed up fitting.
+
+    # --- 2. Time Metric ---
+    # Only include if variable (< 0)
+    if self.columns_len['time'] < 0:
+        # Can choose 'Time' or 'Decade' based on order of magnitude span
+        time_series = self.columns_data['time']
+        if time_series.max() / max(time_series.min(), 1e-12) > 1000:
+            metrics['time'] = "Decade"
+        else:
+            metrics['time'] = "Time"
+
+    # --- 3. Position Space Metric ---
+    var_coords = [coord for coord in ['x', 'y', 'z'] if self.columns_len[coord] < 0]
+    const_coords = [coord for coord in ['x', 'y', 'z'] if self.columns_len[coord] > 0]
+    
+    pos_metric = None
+    plane_orientation = None
+    
+    if len(var_coords) == 3:
+        pos_metric = "Vol"
+        plane_orientation = "3D"
         
-        # constructor for Geometry
-        # kds.Geometry(metrics=, rot=, trasl=)
-        # available metrics (to be put into the kds.Geometry() constructor)
-        # kds.geom._metrics
-        # available pre-built geometries:
-        #  kds.geom.GeomFlat, kds.geom.GeomFlatTemp, kds.geom.GeomGuide, kds.geom.GeomActiv
+    elif len(var_coords) == 2:
+        # Exactly two coordinates vary; find out which ones
+        var_set = set(var_coords)
         
-        metrics = {}
-        constants = {} # for e.g. E0 value
-        
-        # --- 1. Energy Metric ---
-        # Only include if variable (< 0)
-        if self.columns_len['ekin'] < 0:
-            # Default to Energy; could check units or distribution for Lethargy / Wavelength
-            metrics['energy'] = "Energy"
-        # If constant (>0) or missing (0), energy metric is left out entirely to speed up fitting.
-
-        # --- 2. Time Metric ---
-        # Only include if variable (< 0)
-        if self.columns_len['time'] < 0:
-            # Can choose 'Time' or 'Decade' based on order of magnitude span
-            time_series = self.columns_data['time']
-            if time_series.max() / max(time_series.min(), 1e-12) > 1000:
-                metrics['time'] = "Decade"
-            else:
-                metrics['time'] = "Time"
-
-        # --- 3. Position Space Metric ---
-        var_coords = [coord for coord in ['x', 'y', 'z'] if self.columns_len[coord] < 0]
-        const_coords = [coord for coord in ['x', 'y', 'z'] if self.columns_len[coord] > 0]
-        
-        pos_metric = None
-        plane_orientation = None
-        
-        if len(var_coords) == 3:
-            pos_metric = "Vol"
-            plane_orientation = "3D"
+        if "z" not in var_coords:
+            pos_metric = "SurfXY"  # Or SurfR / SurfCircle if radial
+            plane_orientation = "XY"
+        elif "y" not in var_coords:
+            pos_metric = "SurfXY"  # Mapped to surface metric, or custom handling for XZ plane
+            plane_orientation = "XZ"
+        elif "x" not in var_coords:
+            pos_metric = "SurfXY"  # Mapped to surface metric, or custom handling for YZ plane
+            plane_orientation = "YZ"
             
-        elif len(var_coords) == 2:
-            # Exactly two coordinates vary; find out which ones
-            var_set = set(var_coords)
+        # Optional: Check if the constant coordinate has a specific value 
+        # (e.g., z = 0 boundary, or a specific offset)
+        if len(const_coords) != 0:
+            const_val = self.columns_data[const_coords[0]]
+            # You can use const_val to parameterize your geometry constructor if needed
             
-            if "z" not in var_coords:
-                pos_metric = "SurfXY"  # Or SurfR / SurfCircle if radial
-                plane_orientation = "XY"
-            elif "y" not in var_coords:
-                pos_metric = "SurfXY"  # Mapped to surface metric, or custom handling for XZ plane
-                plane_orientation = "XZ"
-            elif "x" not in var_coords:
-                pos_metric = "SurfXY"  # Mapped to surface metric, or custom handling for YZ plane
-                plane_orientation = "YZ"
-                
-            # Optional: Check if the constant coordinate has a specific value 
-            # (e.g., z = 0 boundary, or a specific offset)
-            if len(const_coords) != 0:
-                const_val = self.columns_data[const_coords[0]]
-                # You can use const_val to parameterize your geometry constructor if needed
-                
-        elif len(var_coords) == 1:
-            pos_metric = "SurfR2" # 1D profile along the single variable axis
-            plane_orientation = var_coords[0]
+    elif len(var_coords) == 1:
+        pos_metric = "SurfR2" # 1D profile along the single variable axis
+        plane_orientation = var_coords[0]
 
-        # --- 4. Direction Space Metric ---
-        ux_len = self.columns_len['ux']
-        uy_len = self.columns_len['uy']
-        uz_len = self.columns_len['uz']
-        
-        var_dir = sum(1 for l in [ux_len, uy_len, uz_len] if l < 0)
-        
-        if var_dir > 0:
-            ux_series = self.columns_data['ux']
-            if ux_series is not None and len(ux_series) > 0:
-                # Check angular spread to distinguish guide/beam vs isotropic
-                variance = ux_series.var()
-                if variance < 0.05:
-                    metrics['direction'] = "Guide"
-                else:
-                    # Check if cylindrical symmetry favors Polar or PolarMu
-                    metrics['direction'] = "Isotrop"
+    # --- 4. Direction Space Metric ---
+    ux_len = self.columns_len['ux']
+    uy_len = self.columns_len['uy']
+    uz_len = self.columns_len['uz']
+    
+    var_dir = sum(1 for l in [ux_len, uy_len, uz_len] if l < 0)
+    
+    if var_dir > 0:
+        ux_series = self.columns_data['ux']
+        if ux_series is not None and len(ux_series) > 0:
+            # Check angular spread to distinguish guide/beam vs isotropic
+            variance = ux_series.var()
+            if variance < 0.05:
+                metrics['direction'] = "Guide"
             else:
+                # Check if cylindrical symmetry favors Polar or PolarMu
                 metrics['direction'] = "Isotrop"
+        else:
+            metrics['direction'] = "Isotrop"
 
-        # --- 5. Optional Helper Geometry Matching ---
-        # Match the compiled individual metrics to pre-built helpers if they match standard patterns,
-        # or leave them as a custom-built collection of metrics.
-        helper_geom = "CustomGeometry"
-        pos_m = metrics.get('position')
-        dir_m = metrics.get('direction')
-        time_m = metrics.get('time')
-        
-        if pos_m == "Vol" and dir_m == "Isotrop":
-            helper_geom = "GeomActiv"
-        elif dir_m == "Guide":
-            helper_geom = "GeomGuide"
-        elif time_m is not None and pos_m == "SurfXY":
-            helper_geom = "GeomFlatTemp"
-        elif pos_m == "SurfXY":
-            helper_geom = "GeomFlat"
+    # --- 5. Optional Helper Geometry Matching ---
+    # Match the compiled individual metrics to pre-built helpers if they match standard patterns,
+    # or leave them as a custom-built collection of metrics.
+    helper_geom = "CustomGeometry"
+    pos_m = metrics.get('position')
+    dir_m = metrics.get('direction')
+    time_m = metrics.get('time')
+    
+    if pos_m == "Vol" and dir_m == "Isotrop":
+        helper_geom = "GeomActiv"
+    elif dir_m == "Guide":
+        helper_geom = "GeomGuide"
+    elif time_m is not None and pos_m == "SurfXY":
+        helper_geom = "GeomFlatTemp"
+    elif pos_m == "SurfXY":
+        helper_geom = "GeomFlat"
 
-        return {
-            "helper_geometry": helper_geom,
-            "active_metrics": metrics
-        }
+    return {
+        "helper_geometry": helper_geom,
+        "active_metrics": metrics
+    }
 
     # ---- Augment data (resample) ----
 
