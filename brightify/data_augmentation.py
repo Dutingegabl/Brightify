@@ -119,10 +119,11 @@ def process_func(func, **kwargs):
 
 # ----- DATA I/O -----
 
-def organize_columns(data: pd.DataFrame, col_map=None, inplace=True):
+def organize_columns(data: pd.DataFrame, col_map=None, norm_dir=True, inplace=True):
     """This renames columns to standard names using the COLUMN_ALIASES_LOWERCASE dictionary,
     and drops columns whose names cannot be interpreted.
-    It also makes columns sparse, and uses the DEFAULT_VALUES as fill values if column was missing.
+    It makes the returned data contain all columns that mcpl data can contain.
+    It also makes all columns sparse arrays, and uses the DEFAULT_VALUES as fill values if a column was missing in the input.
 
     Parameters
     ----
@@ -131,10 +132,11 @@ def organize_columns(data: pd.DataFrame, col_map=None, inplace=True):
     Most are automatically recognized, but you can specify here e.g. col_map = {"my_coord_x": "x", "my_coord_y": "y"}.
     The dictionary values must be among the following standard names: "ekin", "pdgcode", "x", "y", "z", "ux", "uy", "uz", "weight", "time", "polx", "poly", "polz", "userflags"
     Note that this allows you to swap columns, e.g. col_map = {"my_x":"y", "my_y":"x"}.
+    - norm_dir: Whether to normalize the direction vectors (ux, uy, uz) to manitude 1. If all of the three columns are missing or zero, an error is produced.
 
     Returns
     ----
-    DataFrame
+    DataFrame (if inplace is True, it is a reference to the manipulated original, else it is a new dataframe)
     """
     # check columns validity
     if len(set(data.columns)) < len(data.columns):
@@ -208,10 +210,6 @@ def organize_columns(data: pd.DataFrame, col_map=None, inplace=True):
 
     return target_df
 
-
-
-
-
 @staticmethod
 def remove_na(data: pd.DataFrame, inplace=True, ignore_index=True):
     """
@@ -227,28 +225,27 @@ def remove_na(data: pd.DataFrame, inplace=True, ignore_index=True):
         print("Warning: The new dataframe is empty.")
     return data
 
-def norm_direction(self, inplace=True):
+def norm_direction(data: pd.DataFrame, inplace=True):
     """
     Calculates the norms of the direction (ux, uy, uz) vectors and prints the average, minimum, and maximum value.
     - norm_dir: if True, the (ux, uy, uz) vectors will be normalized to magnitude 1.
     - inplace: if True, the same dataframe object will be returned. Else, a copy.
     Note: The returned data will contain all 3 direction columns (ux, uy, uz) if at least one component column exists (filling in default value 0 for missing components).
     """
-
     dir_cols = ["ux", "uy", "uz"]
-        dir_mag = np.sqrt(data["ux"]**2 + data["uy"]**2 + data["uz"]**2)
-        print(f"Direction vector magnitudes -> Min: {dir_mag.min():.4f}, Max: {dir_mag.max():.4f}, Mean: {dir_mag.mean():.4f}")
-        if np.allclose(dir_mag, 1.0):
-            print("Direction vectors are already normalized.")
-        else:
-            print("Direction vectors are not already normalized.")
-            if norm_dir:
-                # Prevent division by zero
-                safe_dir_mag = np.where(dir_mag == 0, 1.0, dir_mag)
-                data["ux"] = data["ux"] / safe_dir_mag
-                data["uy"] = data["uy"] / safe_dir_mag
-                data["uz"] = data["uz"] / safe_dir_mag
-                print("-> Direction vectors have been normalized to magnitude 1.")
+    dir_mag = np.sqrt(data["ux"]**2 + data["uy"]**2 + data["uz"]**2)
+    print(f"Direction vector magnitudes -> Min: {dir_mag.min():.4f}, Max: {dir_mag.max():.4f}, Mean: {dir_mag.mean():.4f}")
+    if np.allclose(dir_mag, 1.0):
+        print("Direction vectors are already normalized.")
+    else:
+        print("Direction vectors are not already normalized.")
+        if norm_dir:
+            # Prevent division by zero
+            safe_dir_mag = np.where(dir_mag == 0, 1.0, dir_mag)
+            data["ux"] = data["ux"] / safe_dir_mag
+            data["uy"] = data["uy"] / safe_dir_mag
+            data["uz"] = data["uz"] / safe_dir_mag
+            print("-> Direction vectors have been normalized to magnitude 1.")
 
     return data
 
