@@ -7,7 +7,7 @@
 # required methods
 # 1. read mcpl into dataframe, only the needed columns
 # 2. write dataframe to mcpl
-# 3. detect geometry of data
+# 3. detect geometry/metrics of data
 # 4. perform kds fit based on a geometry and other parameters
 # 5. resample to mcpl based on original mcpl and fit output
 # 6. comparing of two dataframes, using of different metrics:
@@ -209,14 +209,17 @@ def write_df_to_mcpl(data: pd.DataFrame, mcpl_file_path, double_prec=False, forc
 
 # ----- 3. -----
 
-def automatic_geometry(df, trasl=None, rot=None):
+def automatic_metrics(df, trasl=None, rot=None):
     """
     Analyzes an MCPL pandas DataFrame using user-supplied trasl and rot frames to:
       1. Transform input coordinates into the local coordinate system.
       2. Compute the 8-variable importance vector (ekin, x, y, z, ux, uy, uz, time) 
          in that aligned frame.
-      3. Automatically select and instantiate the best matching Metrics from geom.py,
-         returning a fully constructed Geometry object.
+      3. Automatically select and instantiate the best matching Metrics from kds.geom
+    
+    Returns
+    -------
+    importance, metrics_list
     """
     vars_list = ["ekin", "x", "y", "z", "ux", "uy", "uz", "time"]
     weights = df["weight"].values if "weight" in df.columns else np.ones(len(df))
@@ -309,7 +312,7 @@ def automatic_geometry(df, trasl=None, rot=None):
     else:
         # Position Metric Selection
         if not xy_active and z_is_constant:
-            metrics_selected.appendkds.geom.(SurfXY(xmin=0, xmax=0, ymin=0, ymax=0, z=float(np.mean(z_val))))
+            metrics_selected.append(kds.geom.SurfXY(xmin=0, xmax=0, ymin=0, ymax=0, z=float(np.mean(z_val))))
         elif z_is_constant:
             z_fixed = float(np.mean(z_val))
             xmin, xmax = float(np.min(x_val)), float(np.max(x_val))
@@ -343,40 +346,85 @@ def automatic_geometry(df, trasl=None, rot=None):
             metrics_selected.append(kds.geom.Decade())
         else:
             metrics_selected.append(kds.geom.Time())
-
-    # ---------------------------------------------------------
-    # 4. Construct and Return Optimal Geometry
-    # ---------------------------------------------------------
-    optimal_geometry = kds.geom.Geometry(metrics=metrics_selected, trasl=trasl, rot=rot)
     
-    return {
-        "geometry": optimal_geometry,
-        "importance_vector": importance_vector,
-        "trasl": trasl,
-        "rot": rot,
-        "detected_metrics": [m.__class__.__name__ for m in metrics_selected]
-    }
-
-def basic_geometry():
-    return kds.geom.Geometry(metrics=[kds.geom.Energy(), kds.geom.Time(), kds.geom.Vol(), kds.geom.Isotrop()], trasl=None, rot=None)
+    return importance_vector, metrics_selected
 
 # ----- 4. -----
 def fit(mcpl_file_path, xml_file_path,
-        plist_params: dict = {"trasl":None, "rot":None, "switch_x2z":False, "set_params":True},
-        geometry: kds.geom.Geometry = basic_geometry(),
-        source_params: dict = {"bw":"auto", "J":1, "kernel":"gaussian"},
-        fit_params: dict = {"N":-1, "skip":0, "scaling":None, "importance":None, "bw_method":None},
-        fit_bw_kwargs: dict = {},
-        save_params: dict = {"bwfile":None, "adjust_N":True}):
+        trasl = None,
+        rot = None,
+        switch_x2z = False,
+        geometry: kds.geom.Geometry | None = None,
+        bw = "auto",
+        J = 1,
+        kernel = "gaussian",
+        N = -1,
+        skip = 0,
+        scaling = None,
+        importance = None,
+        bw_kwargs = {},
+        bwfile = None,
+        adjust_N = True):
     """
-    This makes a fit and saves a model xml file
+    This makes a fit and saves a model xml file.
+
+    Parameters
+    ---------
+    - mcpl_file_path: input mcpl(.gz) file path
+    - xml_file_path: output model file path
+    - trasl:
+    - rot:
+    - switch_x2z:
+    - geometry: A kdsource.geom.Geometry object (with the same trasl and rot as entered here), or None.
+    If None, it will be attempted to detect a suiting Geometry using up to 100k particles. 
+    Depending on the translation and rotation, the geometry detected will be better or worse.
+    - bw: bandwidth method "auto", "silv", "knn" or "mlcv"
+    - J:
+    - kernel: "gaussian", "epa" or "box"
+    - N: number of particles used at most for the fitting
+    - skip:
+    - scaling: length 8 vector (ekin, x, y, z, ux, uy, uz, time)
+    - importance: length 8 vector (ekin, x, y, z, ux, uy, uz, time). 
+    Note that importance is automatically decided when geometry is None, but that can be overridden by this parameter.
+    - bw_kwargs: kwargs for optimize_bw() and bw_auto(), bw_silv(), bw_knn(), or bw_mlcv()
+    - bwfile: 
+    - adjust_N: 
+
+    Returns
+    -------
+    string path to xml file
     """
-    plist = kds.PList(str(Path(mcpl_file_path).absolute()), readformat="mcpl", pt="n", **plist_params)
-    source = kds.KDSource(plist, geometry, **source_params)
-    source.fit(**fit_params, **fit_bw_kwargs)
-    save_path = str(Path(xml_file_path).absolute())
-    source.save(xmlfilename=save_path, **save_params)
-    return save_path
+
+    mcpl_file_path = str(Path(mcpl_file_path).absolute())
+    xml_file_path = str(Path(xml_file_path).absolute())
+
+    # filter bw_kwargs so nothing crashes
+    allowed_bw_kwargs_all = {"weightfun", "maskfun"} # optimize_bw()
+    allowed_bw_kwargs_auto = {"grid", "Nmlcv", "Nbatch", "Nknn", "show", "n_splits"} # bw_auto()
+    allowed_bw_kwargs_silv = set()
+    allowed_bw_kwargs_knn = {"K_eff", "k", "batch_size"} # bw_knn()
+    allowed_bw_kwargs_mlcv = {"n_splits", "seed", "grid", "show"} # bw_mlcv()
+    bw_kwargs = {k:v for k,v in bw_kwargs.items()
+                 if k in allowed_bw_kwargs_all
+                 or (bw == "auto" and k in allowed_bw_kwargs_auto)
+                 or (bw == "silv" and k in allowed_bw_kwargs_silv)
+                 or (bw == "knn" and k in allowed_bw_kwargs_knn)
+                 or (bw == "mlcv" and k in allowed_bw_kwargs_mlcv)}
+    print("bw_kwargs that were accepted are:", str(bw_kwargs))
+
+    # make plist, geometry, source and then fit and save model xml:
+    plist = kds.PList(str(Path(mcpl_file_path).absolute()), readformat="mcpl", pt="n", trasl=trasl, rot=rot, switch_x2z=switch_x2z, set_params=True)
+    if geometry is None:
+        parts, ws = plist.get(N=100_000)
+        test_df = pd.DataFrame(parts, columns = ["ekin", "x", "y", "z", "ux", "uy", "uz", "time"])
+        test_df["weight"] = ws
+        automatic_importance, automatic_metrics = automatic_metrics(df=test_df, trasl=None, rot=None) # no trasl and rot entered here because the data obtained from plist.get() has them already applied
+        geometry = kds.geom.Geometry(metrics=automatic_metrics, trasl=trasl, rot=rot)
+        if importance is None: importance = automatic_importance
+    source = kds.KDSource(plist=plist, geom=geometry, bw=bw, J=J, kernel=kernel)
+    source.fit(N=N, skip=skip, scaling=scaling, importance=importance, bw_method=None, **bw_kwargs)
+    source.save(xmlfilename=xml_file_path, bwfile=bwfile, adjust_N=adjust_N)
+    return xml_file_path
 
 # ----- 5. -----
 def resample(xml_file_path, mcpl_file_path, amount,
