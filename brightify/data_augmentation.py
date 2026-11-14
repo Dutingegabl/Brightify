@@ -508,19 +508,21 @@ def kl_div_or_js_dist(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "
 
   return results
 
-def c2st(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"}):
-  # Filter common columns
-  cols = [c for c in columns if c in df_p.columns and c in df_q.columns]
-  # Prepare data and labels
-  p_subset = df_p[cols]
-  q_subset = df_q[cols]
-  X = pd.concat([p_subset, q_subset], axis=0)
-  y = np.array([0] * len(p_subset) + [1] * len(q_subset))
-  # Train a classifier with cross-validation
-  clf = RandomForestClassifier(n_estimators=50, random_state=42)
-  scores = cross_val_score(clf, X, y, cv=5, scoring="accuracy")
-  # Return mean accuracy (0.5 = no difference, 1.0 = completely different)
-  return scores.mean()
+def c2st(df_p, df_q, max_samples=50_000, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"}):
+    # Filter common columns
+    cols = [c for c in columns if c in df_p.columns and c in df_q.columns]
+    # Prepare data and labels
+    p_sample_size = min(len(df_p), max_samples)
+    q_sample_size = min(len(df_q), max_samples)
+    p_subset = df_p[cols].sample(n=p_sample_size, random_state=42)
+    q_subset = df_q[cols].sample(n=q_sample_size, random_state=42)
+    X = pd.concat([p_subset, q_subset], axis=0)
+    y = np.array([0] * len(p_subset) + [1] * len(q_subset))
+    # Train a classifier with cross-validation
+    clf = RandomForestClassifier(n_estimators=30, max_depth=12, n_jobs=-1, random_state=42)
+    scores = cross_val_score(clf, X, y, cv=5, scoring="accuracy")
+    # Return mean accuracy (0.5 = no difference, 1.0 = completely different)
+    return scores.mean()
 
 # -------------- UNUSED: --------------
 
