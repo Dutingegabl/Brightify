@@ -288,24 +288,20 @@ def energy_distance(
     if not valid_cols:
         raise ValueError("No matching columns found in both DataFrames.")
         
-    # MEMORY FIX: Subsample the DataFrame directly BEFORE converting to numpy or allocating
-    df_p_sub = df_p[valid_cols]
-    if len(df_p_sub) > max_samples:
-        df_p_sub = df_p_sub.sample(n=max_samples, random_state=random_state)
-        
-    df_q_sub = df_q[valid_cols]
-    if len(df_q_sub) > max_samples:
-        df_q_sub = df_q_sub.sample(n=max_samples, random_state=random_state)
-        
-    X = df_p_sub.to_numpy(dtype=np.float64)
-    Y = df_q_sub.to_numpy(dtype=np.float64)
+    rng = np.random.default_rng(random_state)
+    
+    # CRASH FIX: Extract numpy arrays directly via random row indices (avoids pandas memory overhead)
+    p_indices = rng.choice(len(df_p), size=min(len(df_p), max_samples), replace=False)
+    q_indices = rng.choice(len(df_q), size=min(len(df_q), max_samples), replace=False)
+    
+    X = df_p.iloc[p_indices][valid_cols].to_numpy(dtype=np.float64)
+    Y = df_q.iloc[q_indices][valid_cols].to_numpy(dtype=np.float64)
         
     n = len(X)
     m = len(Y)
     if n == 0 or m == 0:
         raise ValueError("One or both DataFrames are empty for selected columns.")
         
-    # Compute pairwise Euclidean distance matrices using vectorization
     XX_sq = np.sum(X**2, axis=1, keepdims=True)
     YY_sq = np.sum(Y**2, axis=1, keepdims=True)
     
@@ -341,23 +337,18 @@ def maximum_mean_discrepancy(
     if not valid_cols:
         raise ValueError("No matching columns found in both DataFrames.")
 
-    # MEMORY FIX: Subsample the DataFrame directly BEFORE converting to numpy or allocating
-    df_p_sub = df_p[valid_cols]
-    if len(df_p_sub) > max_samples:
-        df_p_sub = df_p_sub.sample(n=max_samples, random_state=random_state)
-        
-    df_q_sub = df_q[valid_cols]
-    if len(df_q_sub) > max_samples:
-        df_q_sub = df_q_sub.sample(n=max_samples, random_state=random_state)
+    rng = np.random.default_rng(random_state)
+    
+    p_indices = rng.choice(len(df_p), size=min(len(df_p), max_samples), replace=False)
+    q_indices = rng.choice(len(df_q), size=min(len(df_q), max_samples), replace=False)
 
-    X = df_p_sub.to_numpy(dtype=np.float64)
-    Y = df_q_sub.to_numpy(dtype=np.float64)
+    X = df_p.iloc[p_indices][valid_cols].to_numpy(dtype=np.float64)
+    Y = df_q.iloc[q_indices][valid_cols].to_numpy(dtype=np.float64)
 
     n, m = len(X), len(Y)
     if n == 0 or m == 0:
         raise ValueError("One or both DataFrames are empty for the selected columns.")
 
-    # Combine data to compute the RBF kernel bandwidth via median heuristic
     XY_pool = np.vstack([X, Y])
     XX_pool = np.sum(XY_pool**2, axis=1, keepdims=True)
     dist_sq_pool = XX_pool + XX_pool.T - 2 * np.dot(XY_pool, XY_pool.T)
@@ -401,14 +392,15 @@ def c2st(
     """
     cols = [c for c in columns if c in df_p.columns and c in df_q.columns]
     if not cols:
-        raise ValueError("No matching columns found in both DataFrames.")
+        raise ValueError("No matching columns found.")
         
-    p_sample_size = min(len(df_p), max_samples)
-    q_sample_size = min(len(df_q), max_samples)
+    rng = np.random.default_rng(random_state)
     
-    # MEMORY FIX: Sample the dataframe subset directly instead of running dropna on 2M rows first
-    p_subset = df_p[cols].sample(n=p_sample_size, random_state=random_state)
-    q_subset = df_q[cols].sample(n=q_sample_size, random_state=random_state)
+    p_indices = rng.choice(len(df_p), size=min(len(df_p), max_samples), replace=False)
+    q_indices = rng.choice(len(df_q), size=min(len(df_q), max_samples), replace=False)
+    
+    p_subset = df_p.iloc[p_indices][cols]
+    q_subset = df_q.iloc[q_indices][cols]
     
     X = pd.concat([p_subset, q_subset], axis=0)
     y = np.array([0] * len(p_subset) + [1] * len(q_subset))
