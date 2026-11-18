@@ -271,7 +271,7 @@ def energy_distance(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    max_samples: int = 10_000,
+    max_samples: int = 5_000,
     random_state: int = 42,
 ) -> float:
     """Calculate the multivariate Energy Distance between two dataframes.
@@ -321,7 +321,7 @@ def maximum_mean_discrepancy(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    max_samples: int = 10_000,
+    max_samples: int = 2_000,
     random_state: int = 42,
 ) -> float:
     """Calculate the multivariate Maximum Mean Discrepancy (MMD)
@@ -383,7 +383,7 @@ def c2st(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    max_samples: int = 20_000,
+    max_samples: int = 10_000,
     random_state: int = 42,
 ) -> float:
     """Make a multivariate Classifier-Two-Sample-Test (C2ST) across all specified columns.
