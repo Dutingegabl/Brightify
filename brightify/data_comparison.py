@@ -230,7 +230,7 @@ def energy_distance(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    max_samples: int = 50000,
+    max_samples: int = 5_000,
     random_state: int = 42,
 ) -> float:
     """Calculate the multivariate Energy Distance between two dataframes.
@@ -286,7 +286,7 @@ def maximum_mean_discrepancy(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    max_samples: int = 50000,
+    max_samples: int = 5_000,
     random_state: int = 42,
 ) -> float:
     """Calculate the multivariate Maximum Mean Discrepancy (MMD)
