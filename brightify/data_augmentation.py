@@ -201,20 +201,31 @@ def write_df_to_mcpl(data: pd.DataFrame, mcpl_file_path, double_prec=False, forc
     process_func(kds.write_mcpl, filename=str(Path(mcpl_file_path).absolute()), **write_data, double_prec=double_prec, force=force)
 
 # ----- 3. -----
-def automatic_metrics(df, trasl=None, rot=None):
+def automatic_metrics(df: pd.DataFrame, trasl=None, rot=None, use_wavelength_for_neutrons=True, prefer_cartesian_output: bool = True):
     """
-    Analyzes an MCPL pandas DataFrame using user-supplied trasl and rot frames to:
-      1. Transform input coordinates into the local coordinate system.
-      2. Compute the 8-variable importance vector (ekin, x, y, z, ux, uy, uz, time) 
-         in that aligned frame.
-      3. Automatically select and instantiate the best matching Metrics from kds.geom
+    Analyzes an MCPL pandas DataFrame to automatically find suitable metrics 
+    (as input to kdsource Geometry() constructor), and the importance vector,
+    omitting constant (zero-variance) variables entirely.
+
+    Includes advanced heuristics for Wavelength, SurfR2, SurfCircle, Polar, and PolarMu.
+
+    1. Transform input coordinates coordinate system using trasl and rot (without mutating input dataframe).
+    2. Compute the importance of variables in the transformed frame.
+    3. Automatically select and instantiate the best matching metrics classes from the kdsource geom module,
+       omitting unnecessary/constant/zero-variance variables.
     
     Returns
     -------
-    importance, metrics_list
+    active_importances : dict
+        Dictionary mapping active variable names to their importance values.
+    metrics_selected : list
+        List of instantiated metrics corresponding to active dimensions.
+
+    Assumes "weight", "ekin", "x", "y", "z", "ux", "uy", "uz", and "time" 
+    are always present in df with valid non-NaN values.
     """
     vars_list = ["ekin", "x", "y", "z", "ux", "uy", "uz", "time"]
-    weights = df["weight"].values if "weight" in df.columns else np.ones(len(df))
+    weights = df["weight"].values
     
     # ---------------------------------------------------------
     # 1. Apply User Transformation (trasl & rot) to Data First
@@ -222,7 +233,6 @@ def automatic_metrics(df, trasl=None, rot=None):
     pos = df[["x", "y", "z"]].values.astype(float)
     dir_vecs = df[["ux", "uy", "uz"]].values.astype(float)
     
-    # Parse rotation if given as array-like
     if rot is not None and not isinstance(rot, st.Rotation):
         rot = np.array(rot)
         if rot.shape == (4,):
@@ -234,7 +244,6 @@ def automatic_metrics(df, trasl=None, rot=None):
         else:
             raise ValueError("Invalid rot format supplied.")
 
-    # Match Geometry transform behavior: apply trasl, then rot (using inverse=True to get local frame)
     if trasl is not None:
         trasl_arr = np.array(trasl).reshape(1, 3)
         pos -= trasl_arr
@@ -243,103 +252,134 @@ def automatic_metrics(df, trasl=None, rot=None):
         pos = rot.apply(pos, inverse=True)
         dir_vecs = rot.apply(dir_vecs, inverse=True)
 
-    # Assemble aligned coordinates for analysis
     transformed_data = np.column_stack([
         df["ekin"].values,
         pos,
         dir_vecs,
-        df["time"].values if "time" in df.columns else np.zeros(len(df))
+        df["time"].values
     ])
 
     # ---------------------------------------------------------
-    # 2. Compute 8-Variable Importance Vector in Aligned Frame
+    # 2. Compute Variable Importances in Aligned Frame
     # ---------------------------------------------------------
-    importance_vector = []
+    importances = {}
     for i, var in enumerate(vars_list):
         col_data = transformed_data[:, i]
         w_mean = np.average(col_data, weights=weights)
         w_var = np.average((col_data - w_mean) ** 2, weights=weights)
         
-        # If variance is effectively zero, importance is 0
         if w_var < 1e-14 or np.isnan(w_var):
-            importance_vector.append(0.0)
+            importances[var] = 0.0
         else:
-            importance_vector.append(float(np.sqrt(w_var)))
+            importances[var] = float(np.sqrt(w_var))
             
-    importance_vector = np.array(importance_vector)
-
-    # Isolated aligned coordinate variables for metric configuration
     x_val = pos[:, 0]
     y_val = pos[:, 1]
     z_val = pos[:, 2]
 
     # ---------------------------------------------------------
-    # 3. Detect and Select Optimal Metrics
+    # 3. Detect and Select Optimal Metrics & Build Importance Dict
     # ---------------------------------------------------------
     metrics_selected = []
+    active_importances = {}
 
-    # --- A. Energy Dimension (ekin -> index 0) ---
-    if importance_vector[0] == 0:
-        metrics_selected.append(kds.geom.Energy())
-    else:
+    # --- A. Energy Dimension (ekin) ---
+    if importances["ekin"] > 0:
+        active_importances["ekin"] = importances["ekin"]
         ekin_vals = df["ekin"].values
-        if np.all(ekin_vals > 0) and (np.max(ekin_vals) / np.min(ekin_vals) > 10):
+        
+        is_thermal_neutron = use_wavelength_for_neutrons and np.median(ekin_vals) < 1e-6
+        
+        if is_thermal_neutron:
+            metrics_selected.append(kds.geom.Wavelength())
+        elif np.all(ekin_vals > 0) and (np.max(ekin_vals) / np.min(ekin_vals) > 10):
             E0 = float(np.max(ekin_vals))
             metrics_selected.append(kds.geom.Lethargy(E0=E0))
         else:
             metrics_selected.append(kds.geom.Energy())
 
     # --- B. Position & Direction Dimensions ---
-    z_is_constant = importance_vector[3] == 0
-    xy_active = np.any(importance_vector[1:3] > 0)
-    dir_active = np.any(importance_vector[4:7] > 0)
+    pos_active = importances["x"] > 0 or importances["y"] > 0 or importances["z"] > 0
+    xy_active = importances["x"] > 0 or importances["y"] > 0
+    z_is_constant = importances["z"] == 0
+    dir_active = importances["ux"] > 0 or importances["uy"] > 0 or importances["uz"] > 0
 
-    # Check for Guide structure (position and direction coupled)
-    if xy_active and dir_active and not z_is_constant:
+    guide_added = False
+    if xy_active and not z_is_constant and dir_active:
         xwidth = float(np.max(np.abs(x_val)) * 2)
         yheight = float(np.max(np.abs(y_val)) * 2)
         zmax = float(np.max(z_val))
         if xwidth > 0 and yheight > 0:
             metrics_selected.append(kds.geom.Guide(xwidth=xwidth, yheight=yheight, zmax=zmax))
-    else:
+            for v in ["x", "y", "z", "ux", "uy", "uz"]:
+                active_importances[v] = importances[v]
+            guide_added = True
+    
+    if not guide_added:
         # Position Metric Selection
-        if not xy_active and z_is_constant:
-            metrics_selected.append(kds.geom.SurfXY(xmin=0, xmax=0, ymin=0, ymax=0, z=float(np.mean(z_val))))
-        elif z_is_constant:
-            z_fixed = float(np.mean(z_val))
-            xmin, xmax = float(np.min(x_val)), float(np.max(x_val))
-            ymin, ymax = float(np.min(y_val)), float(np.max(y_val))
-            
-            r_vals = np.sqrt(x_val**2 + y_val**2)
-            is_polar = np.std(r_vals) < (np.mean(r_vals) * 0.5) and np.min(r_vals) == 0
-            
-            if is_polar:
-                rho_max = float(np.max(r_vals))
-                metrics_selected.append(kds.geom.SurfR(rho_min=0, rho_max=rho_max, z=z_fixed))
+        if pos_active:
+            if z_is_constant:
+                z_fixed = float(np.mean(z_val))
+                xmin, xmax = float(np.min(x_val)), float(np.max(x_val))
+                ymin, ymax = float(np.min(y_val)), float(np.max(y_val))
+                
+                r_vals = np.sqrt(x_val**2 + y_val**2)
+                is_polar = np.std(r_vals) < (np.mean(r_vals) * 0.5) and np.min(r_vals) == 0
+                
+                if is_polar:
+                    rho_max = float(np.max(r_vals))
+                    
+                    # Choice 1: Do you want the metric variables to be polar (rho, psi)?
+                    # Use SurfR / SurfR2.
+                    # Choice 2: Do you want the metric variables to stay Cartesian (x, y) 
+                    # despite having a circular boundary? Use SurfCircle!
+                                        
+                    if prefer_cartesian_output:
+                        metrics_selected.append(kds.geom.SurfCircle(rho_min=0, rho_max=rho_max, z=z_fixed))
+                    else:
+                        expected_mean_r2 = 0.5 * (rho_max ** 2)
+                        actual_mean_r2 = np.average(r_vals**2, weights=weights)
+                        
+                        if abs(actual_mean_r2 - expected_mean_r2) / expected_mean_r2 < 0.2:
+                            metrics_selected.append(kds.geom.SurfR2(rho_min=0, rho_max=rho_max, z=z_fixed))
+                        else:
+                            metrics_selected.append(kds.geom.SurfR(rho_min=0, rho_max=rho_max, z=z_fixed))
+                else:
+                    metrics_selected.append(kds.geom.SurfXY(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, z=z_fixed))
             else:
-                metrics_selected.append(kds.geom.SurfXY(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, z=z_fixed))
-        else:
-            xmin, xmax = float(np.min(x_val)), float(np.max(x_val))
-            ymin, ymax = float(np.min(y_val)), float(np.max(y_val))
-            zmin, zmax = float(np.min(z_val)), float(np.max(z_val))
-            metrics_selected.append(kds.geom.Vol(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, zmin=zmin, zmax=zmax))
+                xmin, xmax = float(np.min(x_val)), float(np.max(x_val))
+                ymin, ymax = float(np.min(y_val)), float(np.max(y_val))
+                zmin, zmax = float(np.min(z_val)), float(np.max(z_val))
+                metrics_selected.append(kds.geom.Vol(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, zmin=zmin, zmax=zmax))
+            
+            for v in ["x", "y", "z"]:
+                active_importances[v] = importances[v]
 
-        # Direction Metric Selection (if Guide wasn't added)
-        if not isinstance(metrics_selected[-1], kds.geom.Guide):
-            if not dir_active:
-                metrics_selected.append(kds.geom.Isotrop())
+
+        # Direction Metric Selection
+        if dir_active:
+            uz_vals = dir_vecs[:, 2]
+            uz_clipped = np.clip(uz_vals, -1.0, 1.0)
+            theta_vals = np.arccos(uz_clipped) * (180.0 / np.pi)
+            
+            if np.std(theta_vals, weights=weights) < 15.0:
+                metrics_selected.append(kds.geom.Polar())
             else:
                 metrics_selected.append(kds.geom.PolarMu())
+                
+            for v in ["ux", "uy", "uz"]:
+                active_importances[v] = importances[v]
 
-    # --- C. Time Dimension (time -> index 7) ---
-    if importance_vector[7] > 0:
+    # --- C. Time Dimension (time) ---
+    if importances["time"] > 0:
+        active_importances["time"] = importances["time"]
         time_vals = df["time"].values
         if np.all(time_vals > 0) and (np.max(time_vals) / np.min(time_vals) > 10):
             metrics_selected.append(kds.geom.Decade())
         else:
             metrics_selected.append(kds.geom.Time())
     
-    return importance_vector, metrics_selected
+    return active_importances, metrics_selected
 
 # ----- 4. -----
 def fit(mcpl_file_path, xml_file_path,
@@ -359,6 +399,7 @@ def fit(mcpl_file_path, xml_file_path,
         adjust_N = True):
     """
     This makes a fit and saves a model xml file.
+    Neutrons only.
 
     Parameters
     ---------
@@ -375,8 +416,8 @@ def fit(mcpl_file_path, xml_file_path,
     - kernel: "gaussian", "epa" or "box"
     - N: number of particles used at most for the fitting
     - skip:
-    - scaling: length 8 vector (ekin, x, y, z, ux, uy, uz, time)
-    - importance: length 8 vector (ekin, x, y, z, ux, uy, uz, time). 
+    - scaling: length 8 vector (for variables ekin, x, y, z, ux, uy, uz, time)
+    - importance: length 8 vector (for variables ekin, x, y, z, ux, uy, uz, time). 
     Note that importance is automatically decided when geometry is None, but that can be overridden by this parameter.
     - bw_kwargs: kwargs for optimize_bw() and bw_auto(), bw_silv(), bw_knn(), or bw_mlcv()
     - bwfile: 
@@ -386,6 +427,7 @@ def fit(mcpl_file_path, xml_file_path,
     -------
     string path to xml file
     """
+    standard_variable_names = ["ekin", "x", "y", "z", "ux", "uy", "uz", "time"]
 
     mcpl_file_path = str(Path(mcpl_file_path).absolute())
     xml_file_path = str(Path(xml_file_path).absolute())
@@ -408,11 +450,11 @@ def fit(mcpl_file_path, xml_file_path,
     plist = kds.PList(str(Path(mcpl_file_path).absolute()), readformat="mcpl", pt="n", trasl=trasl, rot=rot, switch_x2z=switch_x2z, set_params=True)
     if geometry is None:
         parts, ws = plist.get(N=100_000)
-        test_df = pd.DataFrame(parts, columns = ["ekin", "x", "y", "z", "ux", "uy", "uz", "time"])
+        test_df = pd.DataFrame(parts, columns = standard_variable_names)
         test_df["weight"] = ws
-        automatic_importance, automatic_metrics = automatic_metrics(df=test_df, trasl=None, rot=None) # no trasl and rot entered here because the data obtained from plist.get() has them already applied
-        geometry = kds.geom.Geometry(metrics=automatic_metrics, trasl=trasl, rot=rot)
-        if importance is None: importance = automatic_importance
+        active_importances, metrics_selected = automatic_metrics(df=test_df, trasl=None, rot=None) # no trasl and rot entered here because the data obtained from plist.get() has them already applied
+        geometry = kds.geom.Geometry(metrics=metrics_selected, trasl=trasl, rot=rot)
+        if importance is None: importance = [active_importances.get(vn, 0.0) for vn in standard_variable_names]
     source = kds.KDSource(plist=plist, geom=geometry, bw=bw, J=J, kernel=kernel)
     source.fit(N=N, skip=skip, scaling=scaling, importance=importance, bw_method=None, **bw_kwargs)
     source.save(xmlfilename=xml_file_path, bwfile=bwfile, adjust_N=adjust_N)
