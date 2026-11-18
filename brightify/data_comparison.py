@@ -1,21 +1,20 @@
 import numpy as np
 import pandas as pd
-from scipy.stats import wasserstein_distance
-from scipy.stats import entropy
+from scipy.stats import ks_2samp, wasserstein_distance, entropy
 from scipy.spatial.distance import jensenshannon
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_score
-from scipy.stats import ks_2samp
 from scipy.signal import savgol_filter
 
-
 # A: Univariate (column-by-column)
-# --------------------------------
+# ----------------------------------
 
 def kolmogorov_smirnov_test(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
+    max_samples: int = 30_000,
+    random_state: int = 42,
 ) -> dict:
     """Calculate the two-sample Kolmogorov-Smirnov (KS) test column-wise
 
@@ -25,6 +24,8 @@ def kolmogorov_smirnov_test(
     which represents the maximum vertical distance between the empirical CDFs.
     """
     results = {}
+    rng = np.random.default_rng(random_state)
+    
     for col in columns:
         if col not in df_p.columns or col not in df_q.columns:
             continue
@@ -35,6 +36,11 @@ def kolmogorov_smirnov_test(
         if len(p_vals) == 0 or len(q_vals) == 0:
             continue
 
+        if len(p_vals) > max_samples:
+            p_vals = rng.choice(p_vals, max_samples, replace=False)
+        if len(q_vals) > max_samples:
+            q_vals = rng.choice(q_vals, max_samples, replace=False)
+
         # ks_2samp returns a result object containing .statistic and .pvalue
         ks_result = ks_2samp(p_vals, q_vals)
 
@@ -43,24 +49,44 @@ def kolmogorov_smirnov_test(
 
     return results
 
-def wasserstein(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"}) -> dict:
+def wasserstein(
+    df_p: pd.DataFrame,
+    df_q: pd.DataFrame,
+    columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
+    max_samples: int = 15_000,
+    random_state: int = 42,
+) -> dict:
     """
     Calculate the Wasserstein distance column-wise for the input dataframes.
     Returns a number between 0 (closest distance) and +inf per column, which scales with and has the unit of the input values.
     """
     results = {}
+    rng = np.random.default_rng(random_state)
+    
     for col in columns:
         if col not in df_p.columns or col not in df_q.columns:
             continue
+            
+        p_vals = df_p[col].dropna().to_numpy()
+        q_vals = df_q[col].dropna().to_numpy()
+
+        if len(p_vals) == 0 or len(q_vals) == 0:
+            continue
+
+        if len(p_vals) > max_samples:
+            p_vals = rng.choice(p_vals, max_samples, replace=False)
+        if len(q_vals) > max_samples:
+            q_vals = rng.choice(q_vals, max_samples, replace=False)
+
         # Works directly on raw data (no binning needed)
-        results[col] = wasserstein_distance(df_p[col], df_q[col])
+        results[col] = float(wasserstein_distance(p_vals, q_vals))
     return results
 
 def population_stability_index(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    num_bins: int = 10,
+    num_bins: int = 50,
     eps: float = 1e-10,
 ) -> dict:
     """Calculate the Population Stability Index (PSI) column-wise
@@ -121,10 +147,14 @@ def population_stability_index(
 
     return results
 
-def _kl_div_or_js_dist(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    bins=10,
-    epsilon=1e-10,
-    metric="") -> dict:
+def _kl_div_or_js_dist(
+    df_p: pd.DataFrame,
+    df_q: pd.DataFrame,
+    columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
+    bins: int = 50,
+    epsilon: float = 1e-10,
+    metric: str = "",
+) -> dict:
     """Calculates column-wise divergence or distance between two pandas DataFrames P and Q.
     Using default natural logarithm (base = e).
 
@@ -147,8 +177,11 @@ def _kl_div_or_js_dist(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", 
         if col not in df_p.columns or col not in df_q.columns:
             continue
 
-        p_data = df_p[col]
-        q_data = df_q[col]
+        p_data = df_p[col].dropna()
+        q_data = df_q[col].dropna()
+
+        if len(p_data) == 0 or len(q_data) == 0:
+            continue
 
         min_val = min(p_data.min(), q_data.min())
         max_val = max(p_data.max(), q_data.max())
@@ -172,18 +205,22 @@ def _kl_div_or_js_dist(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", 
         # Calculate based on selected metric
         if metric == "kl":
             # Compute KL Divergence: D_KL(P || Q) (Asymmetric, unbounded)
-            results[col] = entropy(p_prob, q_prob)
+            results[col] = float(entropy(p_prob, q_prob))
         elif metric == "js":
             # Compute Jensen-Shannon Distance (Symmetric, bounded between 0 and 1)
-            results[col] = jensenshannon(p_prob, q_prob)
+            results[col] = float(jensenshannon(p_prob, q_prob))
         else:
             raise ValueError("Unsupported metric. Choose 'kl' or 'js'.")
 
     return results
 
-def kl_divergence(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    bins=10,
-    epsilon=1e-10) -> dict:
+def kl_divergence(
+    df_p: pd.DataFrame,
+    df_q: pd.DataFrame,
+    columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
+    bins: int = 50,
+    epsilon: float = 1e-10,
+) -> dict:
     """Calculates the asymmetric Kullback-Leibler Divergence (P || Q) column-wise between two pandas DataFrames P and Q.
     Returns a Value between 0 (least divergence) and +inf, per column.
     
@@ -201,9 +238,13 @@ def kl_divergence(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy",
     """
     return _kl_div_or_js_dist(df_p=df_p, df_q=df_q, columns=columns, bins=bins, epsilon=epsilon, metric="kl")
 
-def js_distance(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    bins=10,
-    epsilon=1e-10) -> dict:
+def js_distance(
+    df_p: pd.DataFrame,
+    df_q: pd.DataFrame,
+    columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
+    bins: int = 50,
+    epsilon: float = 1e-10,
+) -> dict:
     """Calculates the symmetric Jensen-Shannon Distance column-wise between two pandas DataFrames P and Q.
     Returns a value between 0 (closest distance) and 0.832 = sqrt(ln 2), per column. 
 
@@ -230,7 +271,7 @@ def energy_distance(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    max_samples: int = 5_000,
+    max_samples: int = 10_000,
     random_state: int = 42,
 ) -> float:
     """Calculate the multivariate Energy Distance between two dataframes.
@@ -247,8 +288,8 @@ def energy_distance(
     if not valid_cols:
         raise ValueError("No matching columns found in both DataFrames.")
         
-    X = df_p[valid_cols].to_numpy()
-    Y = df_q[valid_cols].to_numpy()
+    X = df_p[valid_cols].dropna().to_numpy()
+    Y = df_q[valid_cols].dropna().to_numpy()
     
     # Optional random subsampling to handle massive MCPL datasets efficiently
     rng = np.random.default_rng(random_state)
@@ -286,7 +327,7 @@ def maximum_mean_discrepancy(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    max_samples: int = 5_000,
+    max_samples: int = 10_000,
     random_state: int = 42,
 ) -> float:
     """Calculate the multivariate Maximum Mean Discrepancy (MMD)
@@ -303,8 +344,8 @@ def maximum_mean_discrepancy(
     if not valid_cols:
         raise ValueError("No matching columns found in both DataFrames.")
 
-    X = df_p[valid_cols].to_numpy()
-    Y = df_q[valid_cols].to_numpy()
+    X = df_p[valid_cols].dropna().to_numpy()
+    Y = df_q[valid_cols].dropna().to_numpy()
 
     # Optional random subsampling to handle massive MCPL datasets efficiently
     rng = np.random.default_rng(random_state)
@@ -356,7 +397,7 @@ def c2st(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    max_samples: int = 50_000,
+    max_samples: int = 20_000,
     random_state: int = 42,
 ) -> float:
     """Make a multivariate Classifier-Two-Sample-Test (C2ST) across all specified columns.
@@ -370,17 +411,16 @@ def c2st(
     p_sample_size = min(len(df_p), max_samples)
     q_sample_size = min(len(df_q), max_samples)
     
-    p_subset = df_p[cols].sample(n=p_sample_size, random_state=random_state)
-    q_subset = df_q[cols].sample(n=q_sample_size, random_state=random_state)
+    p_subset = df_p[cols].dropna().sample(n=p_sample_size, random_state=random_state)
+    q_subset = df_q[cols].dropna().sample(n=q_sample_size, random_state=random_state)
     
     X = pd.concat([p_subset, q_subset], axis=0)
     y = np.array([0] * len(p_subset) + [1] * len(q_subset))
     
-    clf = RandomForestClassifier(n_estimators=30, max_depth=12, n_jobs=-1, random_state=random_state)
+    clf = RandomForestClassifier(n_estimators=20, max_depth=8, n_jobs=-1, random_state=random_state)
     scores = cross_val_score(clf, X, y, cv=5, scoring="accuracy")
     
     return float(scores.mean())
-
 
 # C: Combinations
 # ---------------
