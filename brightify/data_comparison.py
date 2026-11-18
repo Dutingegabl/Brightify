@@ -6,6 +6,7 @@ from scipy.spatial.distance import jensenshannon
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_score
 from scipy.stats import ks_2samp
+from scipy.signal import savgol_filter
 
 
 # A: Univariate (column-by-column)
@@ -467,3 +468,76 @@ def evaluate_all_metrics(
         "univariate": evaluate_univariate_metrics(df_p, df_q, columns=columns, bins=bins, eps=eps, verbose=verbose),
         "multivariate": evaluate_multivariate_metrics(df_p, df_q, columns=columns, max_samples=max_samples, random_state=random_state, verbose=verbose),
     }
+
+# OTHER
+# -----
+
+def smooth_elbow(x_array, y_array, plot=False):
+    """
+    Calculate x position of elbow of a falling curve y(x). That is where it has its maximum bend.
+    It first smoothes the curve.
+    """
+    
+    # Smooth the data
+    smoothed_y = savgol_filter(y_array, window_length=5, polyorder=2)
+
+    # Normalize coordinates to find the elbow mathematically
+    x_norm = (x_array - x_array[0]) / (x_array[-1] - x_array[0])
+    y_norm = (smoothed_y - smoothed_y[0]) / (smoothed_y[-1] - smoothed_y[0])
+
+    line_vec = np.array([x_norm[-1] - x_norm[0], y_norm[-1] - y_norm[0]])
+    line_vec = line_vec / np.linalg.norm(line_vec)
+
+    vecs = np.column_stack((x_norm - x_norm[0], y_norm - y_norm[0]))
+    scalar_projections = np.dot(vecs, line_vec)
+    projections = np.outer(scalar_projections, line_vec)
+    perpendicular_vecs = vecs - projections
+    distances = np.linalg.norm(perpendicular_vecs, axis=1)
+
+    elbow_idx = np.argmax(distances)
+    optimal_x = x_array[elbow_idx]
+    optimal_y = smoothed_y[elbow_idx]
+
+    if plot:
+        # Calculate the projection point on the baseline in original coordinates (for drawing)
+        P0 = np.array([x_array[0], smoothed_y[0]])          # Start point
+        P1 = np.array([x_array[-1], smoothed_y[-1]])        # End point
+        P_elbow = np.array([x_array[elbow_idx], smoothed_y[elbow_idx]]) # Elbow point
+
+        chord_vec = P1 - P0
+        chord_unit = chord_vec / np.linalg.norm(chord_vec)
+        elbow_vec = P_elbow - P0
+        proj_length = np.dot(elbow_vec, chord_unit)
+        P_proj = P0 + proj_length * chord_unit  # Closest point on the baseline to the elbow
+
+        # Plotting everything
+        plt.figure(figsize=(10, 6))
+
+        # Plot raw and smoothed curves
+        plt.plot(x_array, y_array, 'o', color='gray', alpha=0.5, label='Raw Y (Noisy)')
+        plt.plot(x_array, smoothed_y, 'b-', linewidth=2, label='Smoothed Trendline')
+
+        # Draw the baseline straight line (chord) from start to end
+        plt.plot([P0[0], P1[0]], [P0[1], P1[1]], 'k--', label='Baseline (Chord Line)', alpha=0.7)
+
+        # Draw the perpendicular distance line from the elbow to the baseline
+        plt.plot([P_elbow[0], P_proj[0]], [P_elbow[1], P_proj[1]], 'r-', linewidth=2.5, label='Max Distance (Elbow Gap)')
+
+        # Highlight the exact elbow point
+        plt.plot(optimal_x, optimal_y, 'ro', markersize=9, label=f'Optimal X: {optimal_x}')
+
+        # Labels and formatting
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.title("Visualizing the Elbow Method & Maximum Perpendicular Distance")
+        plt.legend(loc='upper right')
+        plt.grid(True, linestyle=':', alpha=0.6)
+        plt.show()
+
+    return optimal_x
+
+# %%
+# Example data with bumps/noise
+# n_fit = np.array([100, 300, 500, 1000, 2000, 3000, 5000, 7000, 10000, 15000, 20000])
+# metric = np.array([5.2, 4.8, 3.1, 2.9, 1.6, 1.9, 0.9, 1.1, 0.6, 0.58, 0.57])
+# print(smooth_elbow(x_array=n_fit, y_array=metric, plot=True))
