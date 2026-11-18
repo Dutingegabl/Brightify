@@ -10,10 +10,7 @@
 # 3. detect geometry/metrics of data
 # 4. perform kds fit based on a geometry and other parameters
 # 5. resample to mcpl based on original mcpl and fit output
-# 6. comparing of two dataframes, using of different metrics:
-# - Wasserstein Distance (univariate)
-# - Kullback-Leibler-Divergence or Jensen-Shannon Distance (both univariate)
-# - Classifier-Two-Sample-Test (C2ST) (multivariate)
+# 6. comparing of two dataframes, using of different metrics: see data_comparison.py
 
 # ----- IMPORTS -----
 import sys
@@ -26,15 +23,11 @@ import pandas as pd
 import numpy as np
 import kdsource.api as kds
 import scipy.spatial.transform as st
-from scipy.spatial.distance import jensenshannon
-from scipy.stats import entropy
-from scipy.stats import wasserstein_distance
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import cross_val_score
+from brightify.data_comparison import *
 
 # ----- CONSTANTS -----
 
-DEFAULT_COLUMN_NAMES = ["ekin",
+DEFAULT_COLUMNS_ORDER = ["ekin",
                    "pdgcode",
                    "x",
                    "y",
@@ -49,7 +42,7 @@ DEFAULT_COLUMN_NAMES = ["ekin",
                    "polz",
                    "userflags"]
 
-DEFAULT_VALUES = {
+DEFAULT_COLUMNS_VALUES = {
     "ekin": 0.0,
     "pdgcode": 2112, # neutron
     "x": 0.0,
@@ -66,7 +59,7 @@ DEFAULT_VALUES = {
     "userflags": None,
 }
 
-COLUMN_ALIASES_LOWERCASE = {
+DEFAULT_COLUMNS_ALIASES_LOWERCASE = {
     "ekin": ["ekin", "e", "energy", "ekin_mev", "e_mev", "energy_mev", "mev"],
     "pdgcode": ["pdgcode", "pdg_code", "pdg", "pid", "p_id", "particle_id", "id", "particle", "kf"],
     "x": ["x", "pos_x", "posx", "x_pos", "xpos"],
@@ -151,13 +144,109 @@ def _worker_func(queue, log_file_name, func, **kwargs):
         os.close(orig_stderr)
         os.close(orig_stdout)
 
+def remove_nans_of_df(
+    data: pd.DataFrame, 
+    exempt_columns: list = None, 
+    ignore_index: bool = False,
+    inplace: bool = False
+) -> pd.DataFrame:
+    """
+    Removes rows containing NaN values from a DataFrame.
+    Checks all columns by default, except those listed in 'exempt_columns'.
+    """
+    if exempt_columns is None:
+        exempt_columns = []
+
+    df = data if inplace else data.copy()
+            
+    # Use lowercase set lookup for performance
+    exempt_lower = {str(e).lower() for e in exempt_columns}
+    cols_to_check = [
+        col for col in df.columns 
+        if str(col).lower() not in exempt_lower
+    ]
+    
+    if inplace:
+        df.dropna(subset=cols_to_check, inplace=True)
+        if ignore_index:
+            df.reset_index(drop=True, inplace=True)
+        return df
+    else:
+        return df.dropna(subset=cols_to_check, ignore_index=ignore_index)
+
+def homogenize_df(
+    data: pd.DataFrame, 
+    explanation: dict = None, 
+    exempt_columns: list = None,
+    fill_defaults: bool = True,
+    inplace=False,
+) -> pd.DataFrame:
+    """
+    Cleans, renames, and filters a DataFrame regarding MCPL file standard.
+
+    1. Uses an optional `explanation` dictionary for explicit renamings (e.g., {'my_col': 'ekin'}).
+    2. Maps remaining columns automatically using global `DEFAULT_COLUMNS_ALIASES_LOWERCASE` (e.g. 'E_MeV' will be recognized to be 'ekin').
+    3. Discards unnecessary columns unless they are listed in `exempt_columns`.
+    4. Optionally fills missing standard MCPL columns with `DEFAULT_COLUMNS_VALUES`. 
+
+    The returned dataframe is guaranteed to only contain default column names, plus any `exempt_columns`.
+    
+    Edge Case: If you pass an explanation that maps a column to a custom name not found in DEFAULT_COLUMNS_VALUES nor in `exempt_columns`, then that column will be discarded. 
+    """
+    if explanation is None:
+        explanation = {}
+    if exempt_columns is None:
+        exempt_columns = []
+
+    df = data if inplace else data.copy()
+    
+    rename_map = {}
+    
+    alias_to_standard = {}
+    for std_col, aliases in DEFAULT_COLUMNS_ALIASES_LOWERCASE.items():
+        for alias in aliases:
+            alias_to_standard[alias.lower()] = std_col
+            
+    exempt_lower = {str(e).lower() for e in exempt_columns}
+    
+    for col in df.columns:
+        col_str = str(col)
+        col_lower = col_str.lower()
+        
+        if col_str in explanation:
+            rename_map[col] = explanation[col_str]
+        elif col_lower in alias_to_standard:
+            rename_map[col] = alias_to_standard[col_lower]
+            
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
+    
+    # Filter columns efficiently 
+    valid_standard_cols = set(DEFAULT_COLUMNS_VALUES.keys())
+    cols_to_keep = [
+        col for col in df.columns 
+        if col in valid_standard_cols or str(col).lower() in exempt_lower
+    ]
+    
+    # Only re-index/filter if columns actually need dropping to avoid unnecessary copying
+    if len(cols_to_keep) < len(df.columns):
+        df = df[cols_to_keep]
+    
+    # Fill missing standard columns using scalar broadcasting (saves massive RAM)
+    if fill_defaults:
+        for std_col, default in DEFAULT_COLUMNS_VALUES.items():
+            if std_col not in df.columns:
+                df[std_col] = default  # Scalar assignment avoids np.full() memory allocation
+                    
+    return df
+
 # ----- 1. -----
-def read_mcpl_to_df(mcpl_file_path, n: int =-1, columns: set = {"ekin","pdgcode","x","y","z","ux","uy","uz","weight","time","polx","poly","polz","userflags"}):
+def read_df_from_mcpl(mcpl_file_path, n: int =-1, columns: set = {"ekin","pdgcode","x","y","z","ux","uy","uz","weight","time","polx","poly","polz","userflags"}):
     """
     Read up to n particles from the mcpl file into a pandas dataframe. n==-1 means read all.
     Only the specified columns are read.
     """
-    columns = sorted(columns, key=lambda col: DEFAULT_COLUMN_NAMES.index(col))
+    columns = sorted(columns, key=lambda col: DEFAULT_COLUMNS_ORDER.index(col))
     blocklength = 100000
     gen_file = mcpl.MCPLFile(str(Path(mcpl_file_path).absolute()), blocklength=blocklength)
     datas = []
@@ -191,13 +280,14 @@ def read_mcpl_to_df(mcpl_file_path, n: int =-1, columns: set = {"ekin","pdgcode"
 def write_df_to_mcpl(data: pd.DataFrame, mcpl_file_path, double_prec=False, force=False):
     """
     Write dataframe to a mcpl file using kdsource.
+    Respected column names are: "ekin", "pdgcode", "x", "y", "z", "ux", "uy", "uz", "weight", "time", "polx", "poly", "polz", "userflags".
     Missing columns will be set to default values found in DEFAULT_VALUES,
-    except polx, poly, polz and userflags, which may be set to None in the mcpl file format.
+    except "polx", "poly", "polz" and "userflags", which may be set to None in the mcpl file format.
     Note that writing will fail if e.g. the direction vectors are not normalized or entirely zero, or energy is negative etc.
     """
     write_data = dict()
     N = len(data)
-    for col, default in DEFAULT_VALUES.items():
+    for col, default in DEFAULT_COLUMNS_VALUES.items():
         if col in data.columns:
             write_data[col] = data[col]
         elif default is not None:
@@ -208,21 +298,31 @@ def write_df_to_mcpl(data: pd.DataFrame, mcpl_file_path, double_prec=False, forc
     process_func(kds.write_mcpl, filename=str(Path(mcpl_file_path).absolute()), **write_data, double_prec=double_prec, force=force)
 
 # ----- 3. -----
-
-def automatic_metrics(df, trasl=None, rot=None):
+def automatic_metrics(df: pd.DataFrame, trasl=None, rot=None, use_wavelength_for_neutrons=True, prefer_cartesian_output: bool = True):
     """
-    Analyzes an MCPL pandas DataFrame using user-supplied trasl and rot frames to:
-      1. Transform input coordinates into the local coordinate system.
-      2. Compute the 8-variable importance vector (ekin, x, y, z, ux, uy, uz, time) 
-         in that aligned frame.
-      3. Automatically select and instantiate the best matching Metrics from kds.geom
+    Analyzes an MCPL pandas DataFrame to automatically find suitable metrics 
+    (as input to kdsource Geometry() constructor), and the importance vector,
+    omitting constant (zero-variance) variables entirely.
+
+    Includes advanced heuristics for Wavelength, SurfR2, SurfCircle, Polar, and PolarMu.
+
+    1. Transform input coordinates coordinate system using trasl and rot (without mutating input dataframe).
+    2. Compute the importance of variables in the transformed frame.
+    3. Automatically select and instantiate the best matching metrics classes from the kdsource geom module,
+       omitting unnecessary/constant/zero-variance variables.
     
     Returns
     -------
-    importance, metrics_list
+    active_importances : dict
+        Dictionary mapping active variable names to their importance values.
+    metrics_selected : list
+        List of instantiated metrics corresponding to active dimensions.
+
+    Assumes "weight", "ekin", "x", "y", "z", "ux", "uy", "uz", and "time" 
+    are always present in df with valid non-NaN values.
     """
     vars_list = ["ekin", "x", "y", "z", "ux", "uy", "uz", "time"]
-    weights = df["weight"].values if "weight" in df.columns else np.ones(len(df))
+    weights = df["weight"].values
     
     # ---------------------------------------------------------
     # 1. Apply User Transformation (trasl & rot) to Data First
@@ -230,7 +330,6 @@ def automatic_metrics(df, trasl=None, rot=None):
     pos = df[["x", "y", "z"]].values.astype(float)
     dir_vecs = df[["ux", "uy", "uz"]].values.astype(float)
     
-    # Parse rotation if given as array-like
     if rot is not None and not isinstance(rot, st.Rotation):
         rot = np.array(rot)
         if rot.shape == (4,):
@@ -242,7 +341,6 @@ def automatic_metrics(df, trasl=None, rot=None):
         else:
             raise ValueError("Invalid rot format supplied.")
 
-    # Match Geometry transform behavior: apply trasl, then rot (using inverse=True to get local frame)
     if trasl is not None:
         trasl_arr = np.array(trasl).reshape(1, 3)
         pos -= trasl_arr
@@ -251,103 +349,134 @@ def automatic_metrics(df, trasl=None, rot=None):
         pos = rot.apply(pos, inverse=True)
         dir_vecs = rot.apply(dir_vecs, inverse=True)
 
-    # Assemble aligned coordinates for analysis
     transformed_data = np.column_stack([
         df["ekin"].values,
         pos,
         dir_vecs,
-        df["time"].values if "time" in df.columns else np.zeros(len(df))
+        df["time"].values
     ])
 
     # ---------------------------------------------------------
-    # 2. Compute 8-Variable Importance Vector in Aligned Frame
+    # 2. Compute Variable Importances in Aligned Frame
     # ---------------------------------------------------------
-    importance_vector = []
+    importances = {}
     for i, var in enumerate(vars_list):
         col_data = transformed_data[:, i]
         w_mean = np.average(col_data, weights=weights)
         w_var = np.average((col_data - w_mean) ** 2, weights=weights)
         
-        # If variance is effectively zero, importance is 0
         if w_var < 1e-14 or np.isnan(w_var):
-            importance_vector.append(0.0)
+            importances[var] = 0.0
         else:
-            importance_vector.append(float(np.sqrt(w_var)))
+            importances[var] = float(np.sqrt(w_var))
             
-    importance_vector = np.array(importance_vector)
-
-    # Isolated aligned coordinate variables for metric configuration
     x_val = pos[:, 0]
     y_val = pos[:, 1]
     z_val = pos[:, 2]
 
     # ---------------------------------------------------------
-    # 3. Detect and Select Optimal Metrics
+    # 3. Detect and Select Optimal Metrics & Build Importance Dict
     # ---------------------------------------------------------
     metrics_selected = []
+    active_importances = {}
 
-    # --- A. Energy Dimension (ekin -> index 0) ---
-    if importance_vector[0] == 0:
-        metrics_selected.append(kds.geom.Energy())
-    else:
+    # --- A. Energy Dimension (ekin) ---
+    if importances["ekin"] > 0:
+        active_importances["ekin"] = importances["ekin"]
         ekin_vals = df["ekin"].values
-        if np.all(ekin_vals > 0) and (np.max(ekin_vals) / np.min(ekin_vals) > 10):
+        
+        is_thermal_neutron = use_wavelength_for_neutrons and np.median(ekin_vals) < 1e-6
+        
+        if is_thermal_neutron:
+            metrics_selected.append(kds.geom.Wavelength())
+        elif np.all(ekin_vals > 0) and (np.max(ekin_vals) / np.min(ekin_vals) > 10):
             E0 = float(np.max(ekin_vals))
             metrics_selected.append(kds.geom.Lethargy(E0=E0))
         else:
             metrics_selected.append(kds.geom.Energy())
 
     # --- B. Position & Direction Dimensions ---
-    z_is_constant = importance_vector[3] == 0
-    xy_active = np.any(importance_vector[1:3] > 0)
-    dir_active = np.any(importance_vector[4:7] > 0)
+    pos_active = importances["x"] > 0 or importances["y"] > 0 or importances["z"] > 0
+    xy_active = importances["x"] > 0 or importances["y"] > 0
+    z_is_constant = importances["z"] == 0
+    dir_active = importances["ux"] > 0 or importances["uy"] > 0 or importances["uz"] > 0
 
-    # Check for Guide structure (position and direction coupled)
-    if xy_active and dir_active and not z_is_constant:
+    guide_added = False
+    if xy_active and not z_is_constant and dir_active:
         xwidth = float(np.max(np.abs(x_val)) * 2)
         yheight = float(np.max(np.abs(y_val)) * 2)
         zmax = float(np.max(z_val))
         if xwidth > 0 and yheight > 0:
             metrics_selected.append(kds.geom.Guide(xwidth=xwidth, yheight=yheight, zmax=zmax))
-    else:
+            for v in ["x", "y", "z", "ux", "uy", "uz"]:
+                active_importances[v] = importances[v]
+            guide_added = True
+    
+    if not guide_added:
         # Position Metric Selection
-        if not xy_active and z_is_constant:
-            metrics_selected.append(kds.geom.SurfXY(xmin=0, xmax=0, ymin=0, ymax=0, z=float(np.mean(z_val))))
-        elif z_is_constant:
-            z_fixed = float(np.mean(z_val))
-            xmin, xmax = float(np.min(x_val)), float(np.max(x_val))
-            ymin, ymax = float(np.min(y_val)), float(np.max(y_val))
-            
-            r_vals = np.sqrt(x_val**2 + y_val**2)
-            is_polar = np.std(r_vals) < (np.mean(r_vals) * 0.5) and np.min(r_vals) == 0
-            
-            if is_polar:
-                rho_max = float(np.max(r_vals))
-                metrics_selected.append(kds.geom.SurfR(rho_min=0, rho_max=rho_max, z=z_fixed))
+        if pos_active:
+            if z_is_constant:
+                z_fixed = float(np.mean(z_val))
+                xmin, xmax = float(np.min(x_val)), float(np.max(x_val))
+                ymin, ymax = float(np.min(y_val)), float(np.max(y_val))
+                
+                r_vals = np.sqrt(x_val**2 + y_val**2)
+                is_polar = np.std(r_vals) < (np.mean(r_vals) * 0.5) and np.min(r_vals) == 0
+                
+                if is_polar:
+                    rho_max = float(np.max(r_vals))
+                    
+                    # Choice 1: Do you want the metric variables to be polar (rho, psi)?
+                    # Use SurfR / SurfR2.
+                    # Choice 2: Do you want the metric variables to stay Cartesian (x, y) 
+                    # despite having a circular boundary? Use SurfCircle!
+                                        
+                    if prefer_cartesian_output:
+                        metrics_selected.append(kds.geom.SurfCircle(rho_min=0, rho_max=rho_max, z=z_fixed))
+                    else:
+                        expected_mean_r2 = 0.5 * (rho_max ** 2)
+                        actual_mean_r2 = np.average(r_vals**2, weights=weights)
+                        
+                        if abs(actual_mean_r2 - expected_mean_r2) / expected_mean_r2 < 0.2:
+                            metrics_selected.append(kds.geom.SurfR2(rho_min=0, rho_max=rho_max, z=z_fixed))
+                        else:
+                            metrics_selected.append(kds.geom.SurfR(rho_min=0, rho_max=rho_max, z=z_fixed))
+                else:
+                    metrics_selected.append(kds.geom.SurfXY(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, z=z_fixed))
             else:
-                metrics_selected.append(kds.geom.SurfXY(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, z=z_fixed))
-        else:
-            xmin, xmax = float(np.min(x_val)), float(np.max(x_val))
-            ymin, ymax = float(np.min(y_val)), float(np.max(y_val))
-            zmin, zmax = float(np.min(z_val)), float(np.max(z_val))
-            metrics_selected.append(kds.geom.Vol(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, zmin=zmin, zmax=zmax))
+                xmin, xmax = float(np.min(x_val)), float(np.max(x_val))
+                ymin, ymax = float(np.min(y_val)), float(np.max(y_val))
+                zmin, zmax = float(np.min(z_val)), float(np.max(z_val))
+                metrics_selected.append(kds.geom.Vol(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, zmin=zmin, zmax=zmax))
+            
+            for v in ["x", "y", "z"]:
+                active_importances[v] = importances[v]
 
-        # Direction Metric Selection (if Guide wasn't added)
-        if not isinstance(metrics_selected[-1], kds.geom.Guide):
-            if not dir_active:
-                metrics_selected.append(kds.geom.Isotrop())
+
+        # Direction Metric Selection
+        if dir_active:
+            uz_vals = dir_vecs[:, 2]
+            uz_clipped = np.clip(uz_vals, -1.0, 1.0)
+            theta_vals = np.arccos(uz_clipped) * (180.0 / np.pi)
+            
+            if np.std(theta_vals, weights=weights) < 15.0:
+                metrics_selected.append(kds.geom.Polar())
             else:
                 metrics_selected.append(kds.geom.PolarMu())
+                
+            for v in ["ux", "uy", "uz"]:
+                active_importances[v] = importances[v]
 
-    # --- C. Time Dimension (time -> index 7) ---
-    if importance_vector[7] > 0:
+    # --- C. Time Dimension (time) ---
+    if importances["time"] > 0:
+        active_importances["time"] = importances["time"]
         time_vals = df["time"].values
         if np.all(time_vals > 0) and (np.max(time_vals) / np.min(time_vals) > 10):
             metrics_selected.append(kds.geom.Decade())
         else:
             metrics_selected.append(kds.geom.Time())
     
-    return importance_vector, metrics_selected
+    return active_importances, metrics_selected
 
 # ----- 4. -----
 def fit(mcpl_file_path, xml_file_path,
@@ -367,6 +496,7 @@ def fit(mcpl_file_path, xml_file_path,
         adjust_N = True):
     """
     This makes a fit and saves a model xml file.
+    Neutrons only.
 
     Parameters
     ---------
@@ -383,8 +513,8 @@ def fit(mcpl_file_path, xml_file_path,
     - kernel: "gaussian", "epa" or "box"
     - N: number of particles used at most for the fitting
     - skip:
-    - scaling: length 8 vector (ekin, x, y, z, ux, uy, uz, time)
-    - importance: length 8 vector (ekin, x, y, z, ux, uy, uz, time). 
+    - scaling: length 8 vector (for variables ekin, x, y, z, ux, uy, uz, time)
+    - importance: length 8 vector (for variables ekin, x, y, z, ux, uy, uz, time). 
     Note that importance is automatically decided when geometry is None, but that can be overridden by this parameter.
     - bw_kwargs: kwargs for optimize_bw() and bw_auto(), bw_silv(), bw_knn(), or bw_mlcv()
     - bwfile: 
@@ -394,6 +524,7 @@ def fit(mcpl_file_path, xml_file_path,
     -------
     string path to xml file
     """
+    standard_variable_names = ["ekin", "x", "y", "z", "ux", "uy", "uz", "time"]
 
     mcpl_file_path = str(Path(mcpl_file_path).absolute())
     xml_file_path = str(Path(xml_file_path).absolute())
@@ -416,11 +547,11 @@ def fit(mcpl_file_path, xml_file_path,
     plist = kds.PList(str(Path(mcpl_file_path).absolute()), readformat="mcpl", pt="n", trasl=trasl, rot=rot, switch_x2z=switch_x2z, set_params=True)
     if geometry is None:
         parts, ws = plist.get(N=100_000)
-        test_df = pd.DataFrame(parts, columns = ["ekin", "x", "y", "z", "ux", "uy", "uz", "time"])
+        test_df = pd.DataFrame(parts, columns = standard_variable_names)
         test_df["weight"] = ws
-        automatic_importance, automatic_metrics = automatic_metrics(df=test_df, trasl=None, rot=None) # no trasl and rot entered here because the data obtained from plist.get() has them already applied
-        geometry = kds.geom.Geometry(metrics=automatic_metrics, trasl=trasl, rot=rot)
-        if importance is None: importance = automatic_importance
+        active_importances, metrics_selected = automatic_metrics(df=test_df, trasl=None, rot=None) # no trasl and rot entered here because the data obtained from plist.get() has them already applied
+        geometry = kds.geom.Geometry(metrics=metrics_selected, trasl=trasl, rot=rot)
+        if importance is None: importance = [active_importances.get(vn, 0.0) for vn in standard_variable_names]
     source = kds.KDSource(plist=plist, geom=geometry, bw=bw, J=J, kernel=kernel)
     source.fit(N=N, skip=skip, scaling=scaling, importance=importance, bw_method=None, **bw_kwargs)
     source.save(xmlfilename=xml_file_path, bwfile=bwfile, adjust_N=adjust_N)
@@ -438,91 +569,8 @@ def resample(xml_file_path, mcpl_file_path, amount,
     process_func(kds.resample_to_mcpl, **params)
 
 # ----- 6. -----
+# see data_comparison.py
 
-def wasserstein(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"}):
-    results = {}
-    for col in columns:
-        if col not in df_p.columns or col not in df_q.columns:
-            continue
-        # Works directly on raw data (no binning needed)
-        results[col] = wasserstein_distance(df_p[col], df_q[col])
-    return results
-
-def kl_div_or_js_dist(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    bins=10,
-    epsilon=1e-10,
-    metric="kl",
-):
-  """Calculates column-wise divergence or distance between two pandas DataFrames P and Q.
-
-  Parameters
-  -----
-  - df_p: Reference DataFrame (P)
-  - df_q: Comparison DataFrame (Q)
-  - columns: which columns to evaluate
-  - bins: Number of bins for continuous numerical columns
-  - epsilon: Smoothing factor to prevent zero-probability errors
-  - metric: "kl" for asymmetric Kullback-Leibler Divergence (P || Q), "js" for symmetric Jensen-Shannon Distance
-
-  Returns
-  -----
-  - dict of divergence/distance values for demanded columns.
-  """
-  results = {}
-
-  for col in columns:
-    if col not in df_p.columns or col not in df_q.columns:
-      continue
-
-    p_data = df_p[col]
-    q_data = df_q[col]
-
-    min_val = min(p_data.min(), q_data.min())
-    max_val = max(p_data.max(), q_data.max())
-
-    # If all values are identical, distance/divergence is 0
-    if min_val == max_val:
-      results[col] = 0.0
-      continue
-
-    bin_edges = np.linspace(min_val, max_val, bins + 1)
-    p_counts, _ = np.histogram(p_data, bins=bin_edges)
-    q_counts, _ = np.histogram(q_data, bins=bin_edges)
-
-    # Convert counts to probability distributions and apply smoothing
-    p_prob = p_counts.astype(float) + epsilon
-    q_prob = q_counts.astype(float) + epsilon
-
-    p_prob /= p_prob.sum()
-    q_prob /= q_prob.sum()
-
-    # Calculate based on selected metric
-    if metric == "kl":
-      # Compute KL Divergence: D_KL(P || Q) (Asymmetric, unbounded)
-      results[col] = entropy(p_prob, q_prob)
-    elif metric == "js":
-      # Compute Jensen-Shannon Distance (Symmetric, bounded between 0 and 1)
-      results[col] = jensenshannon(p_prob, q_prob)
-    else:
-      raise ValueError("Unsupported metric. Choose 'kl' or 'js'.")
-
-  return results
-
-def c2st(df_p, df_q, max_samples=50_000, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"}):
-    # Filter common columns
-    cols = [c for c in columns if c in df_p.columns and c in df_q.columns]
-    # Prepare data and labels
-    p_sample_size = min(len(df_p), max_samples)
-    q_sample_size = min(len(df_q), max_samples)
-    p_subset = df_p[cols].sample(n=p_sample_size, random_state=42)
-    q_subset = df_q[cols].sample(n=q_sample_size, random_state=42)
-    X = pd.concat([p_subset, q_subset], axis=0)
-    y = np.array([0] * len(p_subset) + [1] * len(q_subset))
-    # Train a classifier with cross-validation
-    clf = RandomForestClassifier(n_estimators=30, max_depth=12, n_jobs=-1, random_state=42)
-    scores = cross_val_score(clf, X, y, cv=5, scoring="accuracy")
-    # Return mean accuracy (0.5 = no difference, 1.0 = completely different)
-    return scores.mean()
 
 # -------------- UNUSED: --------------
 
@@ -735,196 +783,3 @@ def c2st(df_p, df_q, max_samples=50_000, columns: set = {"ekin", "x", "y", "z", 
 #                     del_dest=output_is_temp,
 #                     del_source=model_is_temp,
 #                 )
-
-# def organize_columns(data: pd.DataFrame, col_map=None, norm_dir=True, inplace=True):
-#     """This renames columns to standard names using the COLUMN_ALIASES_LOWERCASE dictionary,
-#     and drops columns whose names cannot be interpreted.
-#     It makes the returned data contain all columns that mcpl data can contain.
-#     It also makes all columns sparse arrays, and uses the DEFAULT_VALUES as fill values if a column was missing in the input.
-
-#     Parameters
-#     ----
-#     - data: pandas DataFrame
-#     - col_map (optional): A dictionary explaining any uncommon column names in the input data.
-#     Most are automatically recognized, but you can specify here e.g. col_map = {"my_coord_x": "x", "my_coord_y": "y"}.
-#     The dictionary values must be among the following standard names: "ekin", "pdgcode", "x", "y", "z", "ux", "uy", "uz", "weight", "time", "polx", "poly", "polz", "userflags"
-#     Note that this allows you to swap columns, e.g. col_map = {"my_x":"y", "my_y":"x"}.
-#     - norm_dir: Whether to normalize the direction vectors (ux, uy, uz) to manitude 1. If all of the three columns are missing or zero, an error is produced.
-
-#     Returns
-#     ----
-#     DataFrame (if inplace is True, it is a reference to the manipulated original, else it is a new dataframe)
-#     """
-#     # check columns validity
-#     if len(set(data.columns)) < len(data.columns):
-#         raise ValueError("Input DataFrame must not have the same column name more than once")
-#     col_map = col_map if col_map is not None else {}
-#     for col,std_name in col_map.items():
-#         if col not in data.columns:
-#             raise ValueError("The key columns in col_map must exist in the data")
-#         if std_name not in COLUMN_ALIASES_LOWERCASE.keys():
-#             raise ValueError("The value columns in col_map must be among the standard names")
-#     if len(set(col_map.values())) < len(col_map.values()):
-#         raise ValueError("No standard column name may be used more than once in the values of col_map")
-
-#     # build inv_col_map
-#     inv_col_map = {std_name:col for col,std_name in col_map.items()}
-#     for std_name, aliases in COLUMN_ALIASES_LOWERCASE.items():
-#         if std_name in inv_col_map.keys():
-#             continue
-#         else:
-#             columns_matching = []
-#             for col in data.columns:
-#                 if col.lower() in aliases:
-#                     columns_matching.append(col)
-#             if len(columns_matching) == 0:
-#                 inv_col_map[std_name] = None
-#             elif len(columns_matching) == 1:
-#                 inv_col_map[std_name] = columns_matching[0]
-#             else:
-#                 raise ValueError("More than one column is matching the standard column name '"+std_name+"', namely: "+str(columns_matching))
-
-#     # initialize dataframe to be returned
-#     matched_orig_cols = {orig for orig in inv_col_map.values() if orig is not None}
-#     if inplace:
-#         # 1. Drop unwanted columns immediately to free memory
-#         unwanted_cols = [c for c in data.columns if c not in matched_orig_cols]
-#         if unwanted_cols:
-#             data.drop(columns=unwanted_cols, inplace=True, errors='ignore')
-#         # 2. Rename existing matched columns to their standard names right away
-#         rename_map = {orig: std for std, orig in inv_col_map.items() if orig is not None and orig != std}
-#         if rename_map:
-#             data.rename(columns=rename_map, inplace=True)            
-#         target_df = data
-#     else:
-#         # If not inplace, start with an empty DataFrame with the correct index
-#         target_df = pd.DataFrame(index=data.index)
-
-#     # Process column-by-column: sparsify and assign
-#     for std_name, default_val in DEFAULT_VALUES.items():
-#         # 1. Fetch source series
-#         if inplace:
-#             series = target_df.get(std_name) # returns None if column not existing
-#         else:
-#             orig_col = inv_col_map[std_name]
-#             series = data.get(orig_col) if orig_col is not None else None
-#         # 2. Apply rules based on column presence and contents
-#         if series is None:
-#             # Rule 1: Missing column -> Populate with DEFAULT_VALUES[std_name]
-#             missing_series = pd.Series(default_val, index=target_df.index)
-#             target_df[std_name] = pd.arrays.SparseArray(missing_series, fill_value=default_val)
-#         elif series.dropna().empty:
-#             # Rule 2: Present, but all NaNs/nulls -> Make sparse using NaN as the fill value
-#             target_df[std_name] = pd.arrays.SparseArray(series, fill_value=float('nan'))
-#         else:
-#             # Rule 3: Present with valid data -> Optimal fill value (constant or mode)
-#             if series.nunique() == 1:
-#                 optimal_fill = series.iloc[0]
-#             else:
-#                 mode_vals = series.mode(dropna=False)
-#                 optimal_fill = mode_vals.iloc[0] if not mode_vals.empty else default_val
-#             target_df[std_name] = pd.arrays.SparseArray(series, fill_value=optimal_fill)
-
-#     # Normalize direction vectors if requested
-#     if norm_dir:            
-#         # Convert to dense numpy arrays for calculation
-#         ux = target_df['ux'].to_numpy(dtype=float)
-#         uy = target_df['uy'].to_numpy(dtype=float)
-#         uz = target_df['uz'].to_numpy(dtype=float)
-#         # Calculate magnitude (norm)
-#         norm = np.sqrt(ux**2 + uy**2 + uz**2)
-#         # Check if all entries/columns are zero or missing (norm is 0 everywhere)
-#         if np.all(norm == 0):
-#             raise ValueError("Direction vectors (ux, uy, uz) are all missing or zero.")
-#         # Avoid division by zero for any individual zero-vectors if necessary,
-#         # or normalize where norm > 0
-#         valid_mask = norm > 0
-        
-#         # Initialize normalized arrays
-#         norm_ux = np.zeros_like(ux)
-#         norm_uy = np.zeros_like(uy)
-#         norm_uz = np.zeros_like(uz)
-        
-#         norm_ux[valid_mask] = ux[valid_mask] / norm[valid_mask]
-#         norm_uy[valid_mask] = uy[valid_mask] / norm[valid_mask]
-#         norm_uz[valid_mask] = uz[valid_mask] / norm[valid_mask]
-        
-#         # Re-assign back to target_df as sparse arrays
-#         target_df['ux'] = pd.arrays.SparseArray(norm_ux, fill_value=0.0)
-#         target_df['uy'] = pd.arrays.SparseArray(norm_uy, fill_value=0.0)
-#         target_df['uz'] = pd.arrays.SparseArray(norm_uz, fill_value=0.0)
-
-
-#     return target_df
-
-# def remove_na(data: pd.DataFrame, inplace=True, ignore_index=True):
-#     """
-#     Returns data with rows (not columns) removed that have one (or more) "na" (not assigned/empty/NaN) values, using pandas dropna() method.
-#     - inplace: Set to True to manipulate the input dataframe object instead of obtaining a copy.
-#     - ignore_index: Set True if you want the returned data to have a fresh index starting at 0, instead of keeping the index numbers as before (with the removed rows missing). 
-#     """
-#     if not inplace:
-#         data = data.dropna(inplace=False, ignore_index=ignore_index)
-#     else:
-#         data.dropna(inplace=True, ignore_index=ignore_index)
-#     if len(data) == 0:
-#         print("Warning: The new dataframe is empty.")
-#     return data
-
-# def organize_data(data: pd.DataFrame, col_map: dict = None, rtol=1e-5, atol=1e-8, copy=False):
-#     """
-#     Maps column names to standard names for mcpl data, checks for constant/zero/missing columns, and returns the organized data.
-    
-   
-#     - rtol and atol: relative and absolute tolerance parameters passed to np.isclose() in order to find almost-constant columns (see below).
-#     - copy: Set True if you want the returned dictionary to contain copies of the dataframe columns instead of views/references of them.
-
-#     Returns
-#     ----
-#     inv_col_map, columns_len, columns_data
-
-#     - inv_col_map: Dictionary with the standard column names as keys and the respective input columns' names as values.
-#     - columns_len: Dictionary (with standard name keys) indicating for each column whether it is missing (0), constant (positive integer length of the column), or variable (negative integer column length).
-#     The column length will of course be the length of the input data.
-#     - columns_data: Dictionary (with standard name keys) of the column data, can be None (missing), or a scalar (constant) number, or a variable pandas series.
-#     The series are views on the dataframe columns, unless copy = True.
-
-#     Note: "Almost"-constancy of columns is checked via np.isclose(column, np.mean(column), rtol=rtol, atol=atol).
-#     If True, then the column is considered constant with the mean as the constant value.
-
-#     Note: The method does not handle NaN values in the dataframe. Better remove them beforehand using remove_na() method.
-#     """
-
-#     # check inputs
-    
-#     # build other outputs
-#     columns_len = {} 
-#     columns_data = {}
-#     len_data = len(data)
-#     for std_name, col in inv_col_map.items():
-#         if col is None:
-#             columns_len[std_name] = 0
-#             columns_data[std_name] = None
-#             continue
-#         else:
-#             series = data[col]
-#             if len(series) == 0:
-#                 columns_len[std_name] = 0 # zero -> missing column
-#                 columns_data[std_name] = None # None value
-#             elif series.nunique() == 1:
-#                 first = series.iloc[0]
-#                 columns_len[std_name] = len_data # positive -> constant column
-#                 columns_data[std_name] = first # scalar value
-#             else:
-#                 mean = series.mean()
-#                 if np.all(np.isclose(series, mean, rtol=rtol, atol=atol)):
-#                     columns_len[std_name] = len_data # positive -> constant column
-#                     columns_data[std_name] = mean # scalar value
-#                 else:
-#                     columns_len[std_name] = -len_data # negative -> variable column
-#                     if copy:
-#                         columns_data[std_name] = series.copy() # series value
-#                     else:
-#                         columns_data[std_name] = series # series value
-    
-#     return inv_col_map, columns_len, columns_data
