@@ -95,9 +95,9 @@ def population_stability_index(
 
     Returns a dictionary mapping each column to its PSI value.
     Standard rule-of-thumb thresholds:
-    - PSI < 0.10: No significant distribution change
-    - 0.10 <= PSI < 0.25: Moderate shift
-    - PSI >= 0.25: Significant shift / instability
+- PSI < 0.10: No significant distribution change
+- 0.10 <= PSI < 0.25: Moderate shift
+- PSI >= 0.25: Significant shift / instability
     """
     results = {}
     for col in columns:
@@ -160,16 +160,16 @@ def _kl_div_or_js_dist(
 
     Parameters
     -----
-    - df_p: Reference DataFrame (P)
-    - df_q: Comparison DataFrame (Q)
-    - columns: which columns to evaluate
-    - bins: Number of bins for continuous numerical columns
-    - epsilon: Smoothing factor to prevent zero-probability errors
-    - metric: "kl" for asymmetric Kullback-Leibler Divergence (P || Q), "js" for symmetric Jensen-Shannon Distance
+- df_p: Reference DataFrame (P)
+- df_q: Comparison DataFrame (Q)
+- columns: which columns to evaluate
+- bins: Number of bins for continuous numerical columns
+- epsilon: Smoothing factor to prevent zero-probability errors
+- metric: "kl" for asymmetric Kullback-Leibler Divergence (P || Q), "js" for symmetric Jensen-Shannon Distance
 
     Returns
     -----
-    - dict of divergence/distance values for demanded columns.
+- dict of divergence/distance values for demanded columns.
     """
     results = {}
 
@@ -226,15 +226,15 @@ def kl_divergence(
     
     Parameters
     -----
-    - df_p: Reference DataFrame (P)
-    - df_q: Comparison DataFrame (Q)
-    - columns: which columns to evaluate
-    - bins: Number of bins for continuous numerical columns
-    - epsilon: Smoothing factor to prevent zero-probability errors
+- df_p: Reference DataFrame (P)
+- df_q: Comparison DataFrame (Q)
+- columns: which columns to evaluate
+- bins: Number of bins for continuous numerical columns
+- epsilon: Smoothing factor to prevent zero-probability errors
 
     Returns
     -----
-    - dict of divergence values for demanded columns.
+- dict of divergence values for demanded columns.
     """
     return _kl_div_or_js_dist(df_p=df_p, df_q=df_q, columns=columns, bins=bins, epsilon=epsilon, metric="kl")
 
@@ -250,15 +250,15 @@ def js_distance(
 
     Parameters
     -----
-    - df_p: Reference DataFrame (P)
-    - df_q: Comparison DataFrame (Q)
-    - columns: which columns to evaluate
-    - bins: Number of bins for continuous numerical columns
-    - epsilon: Smoothing factor to prevent zero-probability errors
+- df_p: Reference DataFrame (P)
+- df_q: Comparison DataFrame (Q)
+- columns: which columns to evaluate
+- bins: Number of bins for continuous numerical columns
+- epsilon: Smoothing factor to prevent zero-probability errors
 
     Returns
     -----
-    - dict of distance values for demanded columns.
+- dict of distance values for demanded columns.
     """
 
     return _kl_div_or_js_dist(df_p=df_p, df_q=df_q, columns=columns, bins=bins, epsilon=epsilon, metric="js")
@@ -288,23 +288,20 @@ def energy_distance(
     if not valid_cols:
         raise ValueError("No matching columns found in both DataFrames.")
         
-    X = df_p[valid_cols].dropna().to_numpy()
-    Y = df_q[valid_cols].dropna().to_numpy()
-    
-    # Optional random subsampling to handle massive MCPL datasets efficiently
     rng = np.random.default_rng(random_state)
-    if len(X) > max_samples:
-        X = X[rng.choice(len(X), max_samples, replace=False)]
-    if len(Y) > max_samples:
-        Y = Y[rng.choice(len(Y), max_samples, replace=False)]
+    
+    # CRASH FIX: Extract numpy arrays directly via random row indices (avoids pandas memory overhead)
+    p_indices = rng.choice(len(df_p), size=min(len(df_p), max_samples), replace=False)
+    q_indices = rng.choice(len(df_q), size=min(len(df_q), max_samples), replace=False)
+    
+    X = df_p.iloc[p_indices][valid_cols].to_numpy(dtype=np.float64)
+    Y = df_q.iloc[q_indices][valid_cols].to_numpy(dtype=np.float64)
         
     n = len(X)
     m = len(Y)
     if n == 0 or m == 0:
         raise ValueError("One or both DataFrames are empty for selected columns.")
         
-    # Compute pairwise Euclidean distance matrices using vectorization
-    # D(X, Y)
     XX_sq = np.sum(X**2, axis=1, keepdims=True)
     YY_sq = np.sum(Y**2, axis=1, keepdims=True)
     
@@ -312,15 +309,12 @@ def energy_distance(
     dist_XX = np.sqrt(np.clip(XX_sq + XX_sq.T - 2 * np.dot(X, X.T), 0, None))
     dist_YY = np.sqrt(np.clip(YY_sq + YY_sq.T - 2 * np.dot(Y, Y.T), 0, None))
     
-    # Energy distance formula: 
-    # D^2(X,Y) = 2 * E[|X-Y|] - E[|X-X'|] - E[|Y-Y'|]
     term_xy = np.sum(dist_XY) / (n * m)
     term_xx = np.sum(dist_XX) / (n * n)
     term_yy = np.sum(dist_YY) / (m * m)
     
     energy_dist_sq = 2.0 * term_xy - term_xx - term_yy
     
-    # Due to finite sample variance, safeguard against tiny negative floating point drift
     return float(np.sqrt(np.maximum(0.0, energy_dist_sq)))
 
 def maximum_mean_discrepancy(
@@ -339,31 +333,26 @@ def maximum_mean_discrepancy(
 
     Returns a squared MMD value >= 0.0 (0 means identical distributions).
     """
-
     valid_cols = [c for c in columns if c in df_p.columns and c in df_q.columns]
     if not valid_cols:
         raise ValueError("No matching columns found in both DataFrames.")
 
-    X = df_p[valid_cols].dropna().to_numpy()
-    Y = df_q[valid_cols].dropna().to_numpy()
-
-    # Optional random subsampling to handle massive MCPL datasets efficiently
     rng = np.random.default_rng(random_state)
-    if len(X) > max_samples:
-        X = X[rng.choice(len(X), max_samples, replace=False)]
-    if len(Y) > max_samples:
-        Y = Y[rng.choice(len(Y), max_samples, replace=False)]
+    
+    p_indices = rng.choice(len(df_p), size=min(len(df_p), max_samples), replace=False)
+    q_indices = rng.choice(len(df_q), size=min(len(df_q), max_samples), replace=False)
 
-    n = len(X)
-    m = len(Y)
+    X = df_p.iloc[p_indices][valid_cols].to_numpy(dtype=np.float64)
+    Y = df_q.iloc[q_indices][valid_cols].to_numpy(dtype=np.float64)
+
+    n, m = len(X), len(Y)
     if n == 0 or m == 0:
         raise ValueError("One or both DataFrames are empty for the selected columns.")
 
-    # Combine data to compute the RBF kernel bandwidth via median heuristic
     XY_pool = np.vstack([X, Y])
     XX_pool = np.sum(XY_pool**2, axis=1, keepdims=True)
     dist_sq_pool = XX_pool + XX_pool.T - 2 * np.dot(XY_pool, XY_pool.T)
-    dist_sq_pool = np.clip(dist_sq_pool, 0, None)  # Handle floating-point noise
+    dist_sq_pool = np.clip(dist_sq_pool, 0, None)
 
     median_dist = np.median(dist_sq_pool[dist_sq_pool > 0])
     gamma = 1.0 / (2 * median_dist) if median_dist > 0 else 1.0
@@ -375,12 +364,10 @@ def maximum_mean_discrepancy(
         dist_sq = AA + BB.T - 2 * AB
         return np.exp(-gamma * np.clip(dist_sq, 0, None))
 
-    # Compute kernel sub-matrices
     K_XX = compute_rbf_kernel(X, X, gamma)
     K_YY = compute_rbf_kernel(Y, Y, gamma)
     K_XY = compute_rbf_kernel(X, Y, gamma)
 
-    # Unbiased MMD^2 estimator (excluding diagonal elements for XX and YY)
     np.fill_diagonal(K_XX, 0)
     np.fill_diagonal(K_YY, 0)
 
@@ -390,7 +377,6 @@ def maximum_mean_discrepancy(
 
     mmd_sq = term1 + term2 - term3
 
-    # MMD^2 can theoretically be slightly negative due to finite sample variance
     return float(np.maximum(0.0, mmd_sq))
 
 def c2st(
@@ -406,13 +392,15 @@ def c2st(
     """
     cols = [c for c in columns if c in df_p.columns and c in df_q.columns]
     if not cols:
-        raise ValueError("No matching columns found in both DataFrames.")
+        raise ValueError("No matching columns found.")
         
-    p_sample_size = min(len(df_p), max_samples)
-    q_sample_size = min(len(df_q), max_samples)
+    rng = np.random.default_rng(random_state)
     
-    p_subset = df_p[cols].dropna().sample(n=p_sample_size, random_state=random_state)
-    q_subset = df_q[cols].dropna().sample(n=q_sample_size, random_state=random_state)
+    p_indices = rng.choice(len(df_p), size=min(len(df_p), max_samples), replace=False)
+    q_indices = rng.choice(len(df_q), size=min(len(df_q), max_samples), replace=False)
+    
+    p_subset = df_p.iloc[p_indices][cols]
+    q_subset = df_q.iloc[q_indices][cols]
     
     X = pd.concat([p_subset, q_subset], axis=0)
     y = np.array([0] * len(p_subset) + [1] * len(q_subset))
