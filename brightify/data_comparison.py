@@ -417,8 +417,6 @@ def evaluate_univariate_metrics(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    bins: int = 10,
-    eps: float = 1e-10,
     verbose: bool = True,
 ) -> dict:
     """Run all univariate column-wise metrics safely with error handling."""
@@ -428,11 +426,11 @@ def evaluate_univariate_metrics(
     results = {}
     
     metrics_to_run = {
-        "kolmogorov_smirnov": lambda: kolmogorov_smirnov_test(df_p, df_q, columns),
-        "wasserstein": lambda: wasserstein(df_p, df_q, columns),
-        "psi": lambda: population_stability_index(df_p, df_q, columns, num_bins=bins, eps=eps),
-        "kl_divergence": lambda: kl_divergence(df_p, df_q, columns, bins=bins, epsilon=eps),
-        "js_distance": lambda: js_distance(df_p, df_q, columns, bins=bins, epsilon=eps),
+        "kolmogorov_smirnov": lambda: kolmogorov_smirnov_test(df_p=df_p, df_q=df_q, columns=columns),
+        "wasserstein": lambda: wasserstein(df_p=df_p, df_q=df_q, columns=columns),
+        "psi": lambda: population_stability_index(df_p=df_p, df_q=df_q, columns=columns),
+        "kl_divergence": lambda: kl_divergence(df_p=df_p, df_q=df_q, columns=columns),
+        "js_distance": lambda: js_distance(df_p=df_p, df_q=df_q, columns=columns),
     }
 
     for name, func in metrics_to_run.items():
@@ -451,8 +449,6 @@ def evaluate_multivariate_metrics(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    max_samples: int = 50000,
-    random_state: int = 42,
     verbose: bool = True,
 ) -> dict:
     """Run all multivariate joint distribution metrics safely with error handling."""
@@ -462,9 +458,9 @@ def evaluate_multivariate_metrics(
     results = {}
     
     metrics_to_run = {
-        "energy_distance": lambda: energy_distance(df_p, df_q, columns, max_samples=max_samples, random_state=random_state),
-        "mmd": lambda: maximum_mean_discrepancy(df_p, df_q, columns, max_samples=max_samples, random_state=random_state),
-        "c2st": lambda: c2st(df_p, df_q, columns, max_samples=max_samples, random_state=random_state),
+        "energy_distance": lambda: energy_distance(df_p=df_p, df_q=df_q, columns=columns),
+        "mmd": lambda: maximum_mean_discrepancy(df_p=df_p, df_q=df_q, columns=columns),
+        "c2st": lambda: c2st(df_p=df_p, df_q=df_q, columns=columns),
     }
 
     for name, func in metrics_to_run.items():
@@ -482,10 +478,6 @@ def evaluate_all_metrics(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    bins: int = 10,
-    eps: float = 1e-10,
-    max_samples: int = 50000,
-    random_state: int = 42,
     verbose: bool = True,
 ) -> dict:
     """Master wrapper that safely evaluates both univariate and multivariate suites."""
@@ -493,8 +485,8 @@ def evaluate_all_metrics(
         print("Starting evaluation of all univariate and multivariate metrics...")
     
     return {
-        "univariate": evaluate_univariate_metrics(df_p, df_q, columns=columns, bins=bins, eps=eps, verbose=verbose),
-        "multivariate": evaluate_multivariate_metrics(df_p, df_q, columns=columns, max_samples=max_samples, random_state=random_state, verbose=verbose),
+        "univariate": evaluate_univariate_metrics(df_p=df_p, df_q=df_q, columns=columns, verbose=verbose),
+        "multivariate": evaluate_multivariate_metrics(df_p=df_p, df_q=df_q, columns=columns, verbose=verbose),
     }
 
 # OTHER
