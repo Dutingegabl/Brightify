@@ -10,10 +10,7 @@
 # 3. detect geometry/metrics of data
 # 4. perform kds fit based on a geometry and other parameters
 # 5. resample to mcpl based on original mcpl and fit output
-# 6. comparing of two dataframes, using of different metrics:
-# - Wasserstein Distance (univariate)
-# - Kullback-Leibler-Divergence or Jensen-Shannon Distance (both univariate)
-# - Classifier-Two-Sample-Test (C2ST) (multivariate)
+# 6. comparing of two dataframes, using of different metrics: see data_comparison.py
 
 # ----- IMPORTS -----
 import sys
@@ -26,11 +23,7 @@ import pandas as pd
 import numpy as np
 import kdsource.api as kds
 import scipy.spatial.transform as st
-from scipy.spatial.distance import jensenshannon
-from scipy.stats import entropy
-from scipy.stats import wasserstein_distance
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import cross_val_score
+from brightify.data_comparison import *
 
 # ----- CONSTANTS -----
 
@@ -208,7 +201,6 @@ def write_df_to_mcpl(data: pd.DataFrame, mcpl_file_path, double_prec=False, forc
     process_func(kds.write_mcpl, filename=str(Path(mcpl_file_path).absolute()), **write_data, double_prec=double_prec, force=force)
 
 # ----- 3. -----
-
 def automatic_metrics(df, trasl=None, rot=None):
     """
     Analyzes an MCPL pandas DataFrame using user-supplied trasl and rot frames to:
@@ -438,141 +430,8 @@ def resample(xml_file_path, mcpl_file_path, amount,
     process_func(kds.resample_to_mcpl, **params)
 
 # ----- 6. -----
+# see data_comparison.py
 
-def wasserstein(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"}):
-    """
-    Calculate the Wasserstein distance column-wise for the input dataframes.
-    Returns a number between 0 (closest distance) and +inf per column, which scales with and has the unit of the input values.
-    """
-    results = {}
-    for col in columns:
-        if col not in df_p.columns or col not in df_q.columns:
-            continue
-        # Works directly on raw data (no binning needed)
-        results[col] = wasserstein_distance(df_p[col], df_q[col])
-    return results
-
-def _kl_div_or_js_dist(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    bins=10,
-    epsilon=1e-10,
-    metric=""):
-    """Calculates column-wise divergence or distance between two pandas DataFrames P and Q.
-    Using default natural logarithm (base = e).
-
-    Parameters
-    -----
-    - df_p: Reference DataFrame (P)
-    - df_q: Comparison DataFrame (Q)
-    - columns: which columns to evaluate
-    - bins: Number of bins for continuous numerical columns
-    - epsilon: Smoothing factor to prevent zero-probability errors
-    - metric: "kl" for asymmetric Kullback-Leibler Divergence (P || Q), "js" for symmetric Jensen-Shannon Distance
-
-    Returns
-    -----
-    - dict of divergence/distance values for demanded columns.
-    """
-    results = {}
-
-    for col in columns:
-        if col not in df_p.columns or col not in df_q.columns:
-            continue
-
-        p_data = df_p[col]
-        q_data = df_q[col]
-
-        min_val = min(p_data.min(), q_data.min())
-        max_val = max(p_data.max(), q_data.max())
-
-        # If all values are identical, distance/divergence is 0
-        if min_val == max_val:
-            results[col] = 0.0
-            continue
-
-        bin_edges = np.linspace(min_val, max_val, bins + 1)
-        p_counts, _ = np.histogram(p_data, bins=bin_edges)
-        q_counts, _ = np.histogram(q_data, bins=bin_edges)
-
-        # Convert counts to probability distributions and apply smoothing
-        p_prob = p_counts.astype(float) + epsilon
-        q_prob = q_counts.astype(float) + epsilon
-
-        p_prob /= p_prob.sum()
-        q_prob /= q_prob.sum()
-
-        # Calculate based on selected metric
-        if metric == "kl":
-            # Compute KL Divergence: D_KL(P || Q) (Asymmetric, unbounded)
-            results[col] = entropy(p_prob, q_prob)
-        elif metric == "js":
-            # Compute Jensen-Shannon Distance (Symmetric, bounded between 0 and 1)
-            results[col] = jensenshannon(p_prob, q_prob)
-        else:
-            raise ValueError("Unsupported metric. Choose 'kl' or 'js'.")
-
-    return results
-
-def kl_divergence(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    bins=10,
-    epsilon=1e-10):
-    """Calculates the asymmetric Kullback-Leibler Divergence (P || Q) column-wise between two pandas DataFrames P and Q.
-    Returns a Value between 0 (least divergence) and +inf, per column.
-    
-        Parameters
-        -----
-        - df_p: Reference DataFrame (P)
-        - df_q: Comparison DataFrame (Q)
-        - columns: which columns to evaluate
-        - bins: Number of bins for continuous numerical columns
-        - epsilon: Smoothing factor to prevent zero-probability errors
-    
-        Returns
-        -----
-        - dict of divergence values for demanded columns.
-        """
-    return _kl_div_or_js_dist(df_p=df_p, df_q=df_q, columns=columns, bins=bins, epsilon=epsilon, metric="kl")
-
-def js_distance(df_p, df_q, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
-    bins=10,
-    epsilon=1e-10):
-    """Calculates the symmetric Jensen-Shannon Distance column-wise between two pandas DataFrames P and Q.
-    Returns a value between 0 (closest distance) and 0.832 = sqrt(ln 2), per column. 
-
-    Parameters
-    -----
-    - df_p: Reference DataFrame (P)
-    - df_q: Comparison DataFrame (Q)
-    - columns: which columns to evaluate
-    - bins: Number of bins for continuous numerical columns
-    - epsilon: Smoothing factor to prevent zero-probability errors
-
-    Returns
-    -----
-    - dict of distance values for demanded columns.
-    """
-
-    return _kl_div_or_js_dist(df_p=df_p, df_q=df_q, columns=columns, bins=bins, epsilon=epsilon, metric="js")
-
-def c2st(df_p, df_q, max_samples=50_000, columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"}):
-    """
-    Make a multivariate Classifier-Two-Sample-Test (C2ST) across all specified columns (that are found in both dataframes.)
-    Returns a single number between 0.5 (minimally distinct data) and 1.0 (maximally distinct data).
-    """
-    
-    # Filter common columns
-    cols = [c for c in columns if c in df_p.columns and c in df_q.columns]
-    # Prepare data and labels
-    p_sample_size = min(len(df_p), max_samples)
-    q_sample_size = min(len(df_q), max_samples)
-    p_subset = df_p[cols].sample(n=p_sample_size, random_state=42)
-    q_subset = df_q[cols].sample(n=q_sample_size, random_state=42)
-    X = pd.concat([p_subset, q_subset], axis=0)
-    y = np.array([0] * len(p_subset) + [1] * len(q_subset))
-    # Train a classifier with cross-validation
-    clf = RandomForestClassifier(n_estimators=30, max_depth=12, n_jobs=-1, random_state=42)
-    scores = cross_val_score(clf, X, y, cv=5, scoring="accuracy")
-    # Return mean accuracy (0.5 = no difference, 1.0 = completely different)
-    return scores.mean()
 
 # -------------- UNUSED: --------------
 
