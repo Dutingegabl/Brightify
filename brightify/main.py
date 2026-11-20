@@ -279,13 +279,16 @@ class BrightifyModel:
                 velocities_i = slice_i[vel].to_numpy()
                 weights_i = slice_i['Wt'].to_numpy()
             else:
-                point_mask = slice_mask_func(vec)
-                if not np.any(point_mask):
+                point_selection = slice_mask_func(vec)
+                if point_selection.dtype.kind == "b":
+                    if not np.any(point_selection):
+                        continue
+                elif point_selection.size == 0:
                     continue
                 velocities_i = np.column_stack(
-                    [component[point_mask] for component in velocity_components]
+                    [component[point_selection] for component in velocity_components]
                 )
-                weights_i = weights[point_mask]
+                weights_i = weights[point_selection]
             if len(weights_i) == 0:
                 continue
     
@@ -369,13 +372,16 @@ class BrightifyModel:
                 velocities_i = slice_i[vel].to_numpy()
                 weights_i = slice_i['Wt'].to_numpy()
             else:
-                point_mask = slice_mask_func(vec)
-                if not np.any(point_mask):
+                point_selection = slice_mask_func(vec)
+                if point_selection.dtype.kind == "b":
+                    if not np.any(point_selection):
+                        continue
+                elif point_selection.size == 0:
                     continue
                 velocities_i = np.column_stack(
-                    [component[point_mask] for component in velocity_components]
+                    [component[point_selection] for component in velocity_components]
                 )
-                weights_i = weights[point_mask]
+                weights_i = weights[point_selection]
             if len(weights_i) == 0:
                 continue
     
@@ -715,12 +721,24 @@ class Flat(BrightifyModel):
 
         x_values = data_filt['x'].to_numpy()
         y_values = data_filt['y'].to_numpy()
-        return lambda vec: (
-            (x_values >= vec[0] - self.pos_size_x / 2)
-            & (x_values < vec[0] + self.pos_size_x / 2)
-            & (y_values >= vec[1] - self.pos_size_y / 2)
-            & (y_values < vec[1] + self.pos_size_y / 2)
-        )
+        x_order = np.argsort(x_values)
+        sorted_x = x_values[x_order]
+
+        def select_slice(vec):
+            x_min = vec[0] - self.pos_size_x / 2
+            x_max = vec[0] + self.pos_size_x / 2
+            start = np.searchsorted(sorted_x, x_min, side="left")
+            stop = np.searchsorted(sorted_x, x_max, side="left")
+            candidates = x_order[start:stop]
+
+            y_candidates = y_values[candidates]
+            in_y_window = (
+                (y_candidates >= vec[1] - self.pos_size_y / 2)
+                & (y_candidates < vec[1] + self.pos_size_y / 2)
+            )
+            return np.sort(candidates[in_y_window])
+
+        return select_slice
 
     #------------------ Unified calculation -----------------------#
     def calculate(self, method="adaptive", bins_cart=35, threshold_frac=0.98,
