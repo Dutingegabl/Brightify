@@ -627,8 +627,13 @@ class Flat(BrightifyModel):
         self.y_range = np.arange(self.y_min, self.y_max + 1, self.pos_size_y/4)
         self.x_mesh, self.y_mesh = np.meshgrid(self.x_range, self.y_range)
         self.z_mesh = np.full_like(self.x_mesh, 1.)
-        self.vectors = np.stack((self.x_mesh.flatten(), self.y_mesh.flatten(),
-                                 self.z_mesh.flatten()), axis=-1)
+        vector_dtype = np.result_type(
+            self.x_mesh.dtype, self.y_mesh.dtype, self.z_mesh.dtype
+        )
+        self.vectors = np.empty((self.x_mesh.size, 3), dtype=vector_dtype)
+        self.vectors[:, 0] = self.x_mesh.ravel()
+        self.vectors[:, 1] = self.y_mesh.ravel()
+        self.vectors[:, 2] = self.z_mesh.ravel()
 
     #------------------ Filter function ---------------------------#
     def flat_filter_func(self, data_filt, vec):
