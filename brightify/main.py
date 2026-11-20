@@ -138,7 +138,7 @@ class BrightifyModel:
                 'e': p.ekin,  # Kinetic energy
                 'Wt': p.weight  # Weight of the particle
             }))
-            data = pd.concat(datas, ignore_index=True)
+        data = pd.concat(datas, ignore_index=True)
         return data
 
     # @staticmethod
