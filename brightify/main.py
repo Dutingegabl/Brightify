@@ -186,14 +186,22 @@ class BrightifyModel:
         """
         Compute the standard deviation (sigma) for a given filtered data slice.
         """
+        return self._compute_sigma_from_weights(
+            slice_filt_i['Wt'], Wt_sq_sum, Am, window_weight
+        )
+
+    def _compute_sigma_from_weights(self, weights, Wt_sq_sum, Am, window_weight):
         if window_weight <= 1:
             return 0  # Prevent division by zero
     
         # Compute sigma using precomputed values
         return np.sqrt(
-            np.abs(fc.sum_f(slice_filt_i['Wt']**2) / Wt_sq_sum - Am * window_weight) /
+            np.abs(fc.sum_f(weights**2) / Wt_sq_sum - Am * window_weight) /
             (window_weight - 1)
         )
+
+    def _slice_mask_function(self, data_filt, slice_filter_func):
+        return None
     
     def reset_filter(self):
         """
@@ -257,31 +265,52 @@ class BrightifyModel:
         self.mean_directions = np.full(shape2D, np.nan)
         self.mean_directions_spher = np.full(shape2D, np.nan)
         self.mean_directions_window = np.full(shape2D, np.nan)
+
+        slice_mask_func = self._slice_mask_function(data_filt, slice_filter_func)
+        if slice_mask_func is not None:
+            velocity_components = tuple(
+                data_filt[column].to_numpy(copy=False) for column in vel
+            )
+            weights = data_filt['Wt'].to_numpy(copy=False)
     
         for i, vec in tqdm(enumerate(points), desc='common', total=shape1D, ascii=' #'):
-            slice_i = slice_filter_func(data_filt, vec)
-            if slice_i.empty:
+            if slice_mask_func is None:
+                slice_i = slice_filter_func(data_filt, vec)
+                velocities_i = slice_i[vel].to_numpy()
+                weights_i = slice_i['Wt'].to_numpy()
+            else:
+                point_mask = slice_mask_func(vec)
+                if not np.any(point_mask):
+                    continue
+                velocities_i = np.column_stack(
+                    [component[point_mask] for component in velocity_components]
+                )
+                weights_i = weights[point_mask]
+            if len(weights_i) == 0:
                 continue
     
-            self.total_neutrons[i] = len(slice_i)
-            self.total_weights[i] = fc.sum_f(slice_i.Wt)
-            self.total_mean[i] = np.mean(slice_i.Wt)
+            self.total_neutrons[i] = len(weights_i)
+            self.total_weights[i] = fc.sum_f(weights_i)
+            self.total_mean[i] = np.mean(weights_i)
     
             # Use forced direction if provided, else compute mean direction
             if forced_direction is not None:
                 direction_vec = forced_direction
             else:
-                direction_vec = fc.direction_f(fc.mean_f(slice_i[vel], slice_i.Wt))
+                direction_vec = fc.direction_f(fc.mean_f(velocities_i, weights_i))
     
             self.mean_directions[i] = direction_vec
             self.mean_directions_spher[i] = fc.cart2spher(*direction_vec)
     
             # Apply angular filter
-            slice_filt_i = slice_i[fc.cos_f(slice_i[vel], direction_vec) >= self.dir_window]
-            self.window_weights[i] = fc.sum_f(slice_filt_i.Wt)
+            angular_mask = fc.cos_f(velocities_i, direction_vec) >= self.dir_window
+            window_weights = weights_i[angular_mask]
+            self.window_weights[i] = fc.sum_f(window_weights)
     
             # Sigma and relative error
-            self.sigma[i] = self.compute_sigma(slice_filt_i, Wt_sq_sum, Am, self.window_weights[i])
+            self.sigma[i] = self._compute_sigma_from_weights(
+                window_weights, Wt_sq_sum, Am, self.window_weights[i]
+            )
             self.relative_error[i] = self.sigma[i] / np.sqrt(self.window_weights[i])
     
             # Weighted direction
@@ -325,28 +354,45 @@ class BrightifyModel:
         else:
             self.hist = None
             self.hist_edges = None
+
+        slice_mask_func = self._slice_mask_function(data_filt, slice_filter_func)
+        if slice_mask_func is not None:
+            velocity_components = tuple(
+                data_filt[column].to_numpy(copy=False) for column in vel
+            )
+            weights = data_filt['Wt'].to_numpy(copy=False)
     
         # Loop through the points
         for i, vec in tqdm(enumerate(points), desc='common', total=shape1D, ascii=' #'):
-            # Slice data
-            slice_i = slice_filter_func(data_filt, vec)  
-            if len(slice_i) == 0:
+            if slice_mask_func is None:
+                slice_i = slice_filter_func(data_filt, vec)
+                velocities_i = slice_i[vel].to_numpy()
+                weights_i = slice_i['Wt'].to_numpy()
+            else:
+                point_mask = slice_mask_func(vec)
+                if not np.any(point_mask):
+                    continue
+                velocities_i = np.column_stack(
+                    [component[point_mask] for component in velocity_components]
+                )
+                weights_i = weights[point_mask]
+            if len(weights_i) == 0:
                 continue
     
             # Store basic stats
-            self.total_neutrons[i] = len(slice_i)
-            self.total_weights[i] = fc.sum_f(slice_i.Wt)
-            self.total_mean[i] = np.mean(slice_i.Wt)
+            self.total_neutrons[i] = len(weights_i)
+            self.total_weights[i] = fc.sum_f(weights_i)
+            self.total_mean[i] = np.mean(weights_i)
     
             # Mean direction of slice
-            self.mean_directions[i] = fc.direction_f(fc.mean_f(slice_i[vel], slice_i.Wt))         
+            self.mean_directions[i] = fc.direction_f(fc.mean_f(velocities_i, weights_i))
             self.mean_directions_spher[i] = fc.cart2spher(*self.mean_directions[i])
     
             # ------------------ Cartesian histogram ------------------
-            hist, edges = np.histogramdd(slice_i[vel].to_numpy(),
+            hist, edges = np.histogramdd(velocities_i,
                                          bins=[bins_cart]*3,
                                          range=[[-1,1],[-1,1],[-1,1]],
-                                         weights=slice_i['Wt'])
+                                         weights=weights_i)
             if store_hist:
                 self.hist[i] = hist
                 self.hist_edges[i] = edges
@@ -376,12 +422,14 @@ class BrightifyModel:
             self.adaptive_dir_spher[i] = fc.cart2spher(*adaptive_dir_vec)
     
             # Filter directions within angular window
-            cos_filter = fc.cos_f(slice_i[vel], self.adaptive_dir[i])
-            slice_filt_i = slice_i[cos_filter >= self.dir_window]
-            self.window_weights[i] = fc.sum_f(slice_filt_i.Wt)
+            cos_filter = fc.cos_f(velocities_i, self.adaptive_dir[i])
+            window_weights = weights_i[cos_filter >= self.dir_window]
+            self.window_weights[i] = fc.sum_f(window_weights)
     
             # Sigma and weighted mean direction
-            self.sigma[i] = self.compute_sigma(slice_filt_i, Wt_sq_sum, Am, self.window_weights[i])
+            self.sigma[i] = self._compute_sigma_from_weights(
+                window_weights, Wt_sq_sum, Am, self.window_weights[i]
+            )
             self.relative_error[i] = self.sigma[i] / np.sqrt(self.window_weights[i])
             self.mean_directions_window[i] = self.mean_directions[i] * self.window_weights[i]
 
@@ -449,6 +497,19 @@ class Spherical(BrightifyModel):
         It filters `slice_i` based on the cosine of the angle between `vec` and `data_filt`.
         """
         return data_filt[fc.cos_f(data_filt[pos], vec) > self.pos_window]
+
+    def _slice_mask_function(self, data_filt, slice_filter_func):
+        if (
+            getattr(slice_filter_func, "__self__", None) is not self
+            or getattr(slice_filter_func, "__func__", None)
+            is not Spherical.spherical_filter_func
+            or getattr(type(self), "spherical_filter_func", None)
+            is not Spherical.spherical_filter_func
+        ):
+            return None
+
+        positions = data_filt[pos].to_numpy()
+        return lambda vec: fc.cos_f(positions, vec) > self.pos_window
     
 
     def calculate(self):
@@ -641,6 +702,25 @@ class Flat(BrightifyModel):
                          (data_filt['x'] <  vec[0] + self.pos_size_x/2) & 
                          (data_filt['y'] >= vec[1] - self.pos_size_y/2) &
                          (data_filt['y'] <  vec[1] + self.pos_size_y/2)]
+
+    def _slice_mask_function(self, data_filt, slice_filter_func):
+        if (
+            getattr(slice_filter_func, "__self__", None) is not self
+            or getattr(slice_filter_func, "__func__", None)
+            is not Flat.flat_filter_func
+            or getattr(type(self), "flat_filter_func", None)
+            is not Flat.flat_filter_func
+        ):
+            return None
+
+        x_values = data_filt['x'].to_numpy()
+        y_values = data_filt['y'].to_numpy()
+        return lambda vec: (
+            (x_values >= vec[0] - self.pos_size_x / 2)
+            & (x_values < vec[0] + self.pos_size_x / 2)
+            & (y_values >= vec[1] - self.pos_size_y / 2)
+            & (y_values < vec[1] + self.pos_size_y / 2)
+        )
 
     #------------------ Unified calculation -----------------------#
     def calculate(self, method="adaptive", bins_cart=35, threshold_frac=0.98,
