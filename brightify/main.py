@@ -190,13 +190,18 @@ class BrightifyModel:
             slice_filt_i['Wt'], Wt_sq_sum, Am, window_weight
         )
 
+    @staticmethod
+    def _sum_squares(values):
+        values = np.asarray(values)
+        return np.einsum("i,i->", values, values)
+
     def _compute_sigma_from_weights(self, weights, Wt_sq_sum, Am, window_weight):
         if window_weight <= 1:
             return 0  # Prevent division by zero
     
         # Compute sigma using precomputed values
         return np.sqrt(
-            np.abs(fc.sum_f(weights**2) / Wt_sq_sum - Am * window_weight) /
+            np.abs(self._sum_squares(weights) / Wt_sq_sum - Am * window_weight) /
             (window_weight - 1)
         )
 
@@ -253,8 +258,9 @@ class BrightifyModel:
         forced_direction : np.ndarray or None
             If provided, use this direction for all slices instead of computing mean.
         """
-        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)
-        Am = np.mean(self.data['Wt']**2)
+        weights = self.data['Wt'].to_numpy(copy=False)
+        Wt_sq_sum = self._sum_squares(weights)
+        Am = Wt_sq_sum / len(weights) if len(weights) else np.nan
     
         self.total_neutrons = np.full(shape1D, np.nan)
         self.total_weights = np.full(shape1D, np.nan)
@@ -279,16 +285,13 @@ class BrightifyModel:
                 velocities_i = slice_i[vel].to_numpy()
                 weights_i = slice_i['Wt'].to_numpy()
             else:
-                point_selection = slice_mask_func(vec)
-                if point_selection.dtype.kind == "b":
-                    if not np.any(point_selection):
-                        continue
-                elif point_selection.size == 0:
+                point_mask = slice_mask_func(vec)
+                if not np.any(point_mask):
                     continue
                 velocities_i = np.column_stack(
-                    [component[point_selection] for component in velocity_components]
+                    [component[point_mask] for component in velocity_components]
                 )
-                weights_i = weights[point_selection]
+                weights_i = weights[point_mask]
             if len(weights_i) == 0:
                 continue
     
@@ -336,8 +339,9 @@ class BrightifyModel:
             Whether to retain each slice's histogram and edges after calculation.
         """
         # Calculate mean squared weight (Am) and sum of squared weights (Wt_sq_sum)
-        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)  # Global sum of squared weights
-        Am = np.mean(self.data['Wt']**2)  # Mean squared weight
+        weights = self.data['Wt'].to_numpy(copy=False)
+        Wt_sq_sum = self._sum_squares(weights)  # Global sum of squared weights
+        Am = Wt_sq_sum / len(weights) if len(weights) else np.nan  # Mean squared weight
     
         # Initialize arrays
         self.total_neutrons = np.full(shape1D, np.nan)
@@ -372,16 +376,13 @@ class BrightifyModel:
                 velocities_i = slice_i[vel].to_numpy()
                 weights_i = slice_i['Wt'].to_numpy()
             else:
-                point_selection = slice_mask_func(vec)
-                if point_selection.dtype.kind == "b":
-                    if not np.any(point_selection):
-                        continue
-                elif point_selection.size == 0:
+                point_mask = slice_mask_func(vec)
+                if not np.any(point_mask):
                     continue
                 velocities_i = np.column_stack(
-                    [component[point_selection] for component in velocity_components]
+                    [component[point_mask] for component in velocity_components]
                 )
-                weights_i = weights[point_selection]
+                weights_i = weights[point_mask]
             if len(weights_i) == 0:
                 continue
     
@@ -721,24 +722,12 @@ class Flat(BrightifyModel):
 
         x_values = data_filt['x'].to_numpy()
         y_values = data_filt['y'].to_numpy()
-        x_order = np.argsort(x_values)
-        sorted_x = x_values[x_order]
-
-        def select_slice(vec):
-            x_min = vec[0] - self.pos_size_x / 2
-            x_max = vec[0] + self.pos_size_x / 2
-            start = np.searchsorted(sorted_x, x_min, side="left")
-            stop = np.searchsorted(sorted_x, x_max, side="left")
-            candidates = x_order[start:stop]
-
-            y_candidates = y_values[candidates]
-            in_y_window = (
-                (y_candidates >= vec[1] - self.pos_size_y / 2)
-                & (y_candidates < vec[1] + self.pos_size_y / 2)
-            )
-            return np.sort(candidates[in_y_window])
-
-        return select_slice
+        return lambda vec: (
+            (x_values >= vec[0] - self.pos_size_x / 2)
+            & (x_values < vec[0] + self.pos_size_x / 2)
+            & (y_values >= vec[1] - self.pos_size_y / 2)
+            & (y_values < vec[1] + self.pos_size_y / 2)
+        )
 
     #------------------ Unified calculation -----------------------#
     def calculate(self, method="adaptive", bins_cart=35, threshold_frac=0.98,
@@ -1059,8 +1048,9 @@ class Flat(BrightifyModel):
         self.window_weights = fc.sum_f(slice_filt_i.Wt)
         
         # Compute statistical uncertainty
-        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)  # Global sum of squared weights
-        Am = np.mean(self.data['Wt']**2)  # Mean squared weight
+        weights = self.data['Wt'].to_numpy(copy=False)
+        Wt_sq_sum = self._sum_squares(weights)  # Global sum of squared weights
+        Am = Wt_sq_sum / len(weights) if len(weights) else np.nan  # Mean squared weight
         self.sigma = self.compute_sigma(slice_filt_i, Wt_sq_sum, Am, self.window_weights)
     
             # Calculate relative error
@@ -1086,8 +1076,9 @@ class Flat(BrightifyModel):
         self.x_min, self.x_max = data_filt.x.min(), data_filt.x.max()
         self.y_min, self.y_max = data_filt.y.min(), data_filt.y.max()
         
-        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)  # Global sum of squared weights
-        Am = np.mean(self.data['Wt']**2)  # Mean squared weight
+        weights = self.data['Wt'].to_numpy(copy=False)
+        Wt_sq_sum = self._sum_squares(weights)  # Global sum of squared weights
+        Am = Wt_sq_sum / len(weights) if len(weights) else np.nan  # Mean squared weight
         
         slice_i = data_filt
         self.total_neutrons = len(slice_i)
