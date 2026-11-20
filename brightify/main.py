@@ -282,7 +282,7 @@ class BrightifyModel:
     
             # Sigma and relative error
             self.sigma[i] = self.compute_sigma(slice_filt_i, Wt_sq_sum, Am, self.window_weights[i])
-            self.relative_error[i] = self.r_err[i]
+            self.relative_error[i] = self.sigma[i] / np.sqrt(self.window_weights[i])
     
             # Weighted direction
             self.mean_directions_window[i] = direction_vec * self.window_weights[i]
@@ -382,7 +382,7 @@ class BrightifyModel:
     
             # Sigma and weighted mean direction
             self.sigma[i] = self.compute_sigma(slice_filt_i, Wt_sq_sum, Am, self.window_weights[i])
-            self.relative_error[i] = self.r_err[i]
+            self.relative_error[i] = self.sigma[i] / np.sqrt(self.window_weights[i])
             self.mean_directions_window[i] = self.mean_directions[i] * self.window_weights[i]
 
 
