@@ -793,8 +793,12 @@ class Flat(BrightifyModel):
             directions = self.mean_directions
             directions_spher = self.mean_directions_spher
         elif method == "normal":
-            directions = np.tile((0.0, 0.0, 1.0), (self.x_mesh.size, 1))
-            directions_spher = np.zeros((self.x_mesh.size, 2))
+            directions = np.broadcast_to(
+                (0.0, 0.0, 1.0), (self.x_mesh.size, 3)
+            )
+            directions_spher = np.broadcast_to(
+                (0.0, 0.0), (self.x_mesh.size, 2)
+            )
         else:
             raise ValueError(f"Unknown plotting method: {method}")
         return (
