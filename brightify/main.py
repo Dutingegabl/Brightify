@@ -190,18 +190,13 @@ class BrightifyModel:
             slice_filt_i['Wt'], Wt_sq_sum, Am, window_weight
         )
 
-    @staticmethod
-    def _sum_squares(values):
-        values = np.asarray(values)
-        return np.einsum("i,i->", values, values)
-
     def _compute_sigma_from_weights(self, weights, Wt_sq_sum, Am, window_weight):
         if window_weight <= 1:
             return 0  # Prevent division by zero
     
         # Compute sigma using precomputed values
         return np.sqrt(
-            np.abs(self._sum_squares(weights) / Wt_sq_sum - Am * window_weight) /
+            np.abs(fc.sum_f(weights**2) / Wt_sq_sum - Am * window_weight) /
             (window_weight - 1)
         )
 
@@ -258,9 +253,8 @@ class BrightifyModel:
         forced_direction : np.ndarray or None
             If provided, use this direction for all slices instead of computing mean.
         """
-        weights = self.data['Wt'].to_numpy(copy=False)
-        Wt_sq_sum = self._sum_squares(weights)
-        Am = Wt_sq_sum / len(weights) if len(weights) else np.nan
+        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)
+        Am = np.mean(self.data['Wt']**2)
     
         self.total_neutrons = np.full(shape1D, np.nan)
         self.total_weights = np.full(shape1D, np.nan)
@@ -339,9 +333,8 @@ class BrightifyModel:
             Whether to retain each slice's histogram and edges after calculation.
         """
         # Calculate mean squared weight (Am) and sum of squared weights (Wt_sq_sum)
-        weights = self.data['Wt'].to_numpy(copy=False)
-        Wt_sq_sum = self._sum_squares(weights)  # Global sum of squared weights
-        Am = Wt_sq_sum / len(weights) if len(weights) else np.nan  # Mean squared weight
+        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)  # Global sum of squared weights
+        Am = np.mean(self.data['Wt']**2)  # Mean squared weight
     
         # Initialize arrays
         self.total_neutrons = np.full(shape1D, np.nan)
@@ -688,7 +681,9 @@ class Flat(BrightifyModel):
 
     #------------------ Helper: prepare meshgrid ------------------#
     def prepare_vectors(self):
-        data_filt = self.data_filter
+        self._prepare_vectors(self.data_filter)
+
+    def _prepare_vectors(self, data_filt):
         self.x_min, self.x_max = data_filt.x.min(), data_filt.x.max()
         self.y_min, self.y_max = data_filt.y.min(), data_filt.y.max()
         self.x_range = np.arange(self.x_min, self.x_max + 1, self.pos_size_x/4)
@@ -740,7 +735,7 @@ class Flat(BrightifyModel):
         """
         data_filt = self.data_filter
         self.dir_window = 1 - self.dir_size / (2 * np.pi)
-        self.prepare_vectors()
+        self._prepare_vectors(data_filt)
         self.calculation_method = method
 
         if method == "mean":
@@ -1048,9 +1043,8 @@ class Flat(BrightifyModel):
         self.window_weights = fc.sum_f(slice_filt_i.Wt)
         
         # Compute statistical uncertainty
-        weights = self.data['Wt'].to_numpy(copy=False)
-        Wt_sq_sum = self._sum_squares(weights)  # Global sum of squared weights
-        Am = Wt_sq_sum / len(weights) if len(weights) else np.nan  # Mean squared weight
+        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)  # Global sum of squared weights
+        Am = np.mean(self.data['Wt']**2)  # Mean squared weight
         self.sigma = self.compute_sigma(slice_filt_i, Wt_sq_sum, Am, self.window_weights)
     
             # Calculate relative error
@@ -1076,9 +1070,8 @@ class Flat(BrightifyModel):
         self.x_min, self.x_max = data_filt.x.min(), data_filt.x.max()
         self.y_min, self.y_max = data_filt.y.min(), data_filt.y.max()
         
-        weights = self.data['Wt'].to_numpy(copy=False)
-        Wt_sq_sum = self._sum_squares(weights)  # Global sum of squared weights
-        Am = Wt_sq_sum / len(weights) if len(weights) else np.nan  # Mean squared weight
+        Wt_sq_sum = fc.sum_f(self.data['Wt']**2)  # Global sum of squared weights
+        Am = np.mean(self.data['Wt']**2)  # Mean squared weight
         
         slice_i = data_filt
         self.total_neutrons = len(slice_i)
