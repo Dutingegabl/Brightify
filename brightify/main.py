@@ -289,7 +289,7 @@ class BrightifyModel:
         
         
     def calculate_properties_adaptive(self, data_filt, shape1D, shape2D, 
-                                  slice_filter_func, points, bins_cart=35, threshold_frac=0.98):
+                                  slice_filter_func, points, bins_cart=35, threshold_frac=0.98, store_hist=True):
         """
         Adaptive calculation of total weights, mean weights, directions, 
         and errors using Cartesian histogram to find maxima.
@@ -300,6 +300,8 @@ class BrightifyModel:
             Number of bins along each Cartesian axis (X, Y, Z) for histogram.
         threshold_frac : float
             Fraction of the global histogram maximum to define maxima voxels.
+        store_hist : bool
+            Whether to retain each slice's histogram and edges after calculation.
         """
         # Calculate mean squared weight (Am) and sum of squared weights (Wt_sq_sum)
         Wt_sq_sum = fc.sum_f(self.data['Wt']**2)  # Global sum of squared weights
@@ -317,8 +319,12 @@ class BrightifyModel:
         self.mean_directions_window = np.full(shape2D, np.nan)
         self.adaptive_dir = np.full(shape2D, np.nan)
         self.adaptive_dir_spher = np.full(shape2D, np.nan)
-        self.hist = [None] * shape1D
-        self.hist_edges = [None] * shape1D
+        if store_hist:
+            self.hist = [None] * shape1D
+            self.hist_edges = [None] * shape1D
+        else:
+            self.hist = None
+            self.hist_edges = None
     
         # Loop through the points
         for i, vec in tqdm(enumerate(points), desc='common', total=shape1D, ascii=' #'):
@@ -341,8 +347,9 @@ class BrightifyModel:
                                          bins=[bins_cart]*3,
                                          range=[[-1,1],[-1,1],[-1,1]],
                                          weights=slice_i['Wt'])
-            self.hist[i] = hist
-            self.hist_edges[i] = edges
+            if store_hist:
+                self.hist[i] = hist
+                self.hist_edges[i] = edges
     
             # Threshold maxima
             threshold = threshold_frac * hist.max()
@@ -631,11 +638,13 @@ class Flat(BrightifyModel):
                          (data_filt['y'] <  vec[1] + self.pos_size_y/2)]
 
     #------------------ Unified calculation -----------------------#
-    def calculate(self, method="adaptive", bins_cart=35, threshold_frac=0.98):
+    def calculate(self, method="adaptive", bins_cart=35, threshold_frac=0.98,
+                  store_hist=True):
         """
         Calculate brightness and relative error on the mesh.
 
         method: "mean", "adaptive", or "normal"
+        store_hist: retain adaptive histograms and bin edges (default: True)
         """
         data_filt = self.data_filter
         self.dir_window = 1 - self.dir_size / (2 * np.pi)
@@ -658,7 +667,8 @@ class Flat(BrightifyModel):
                 self.flat_filter_func,
                 self.vectors,
                 bins_cart,
-                threshold_frac
+                threshold_frac,
+                store_hist
             )
         elif method == "normal":
             # Use forced surface-normal direction
