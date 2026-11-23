@@ -1,10 +1,23 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.stats import ks_2samp, wasserstein_distance, entropy
 from scipy.spatial.distance import jensenshannon
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_score
 from scipy.signal import savgol_filter
+
+
+# General
+# -------
+
+MAX_MEMORY_BYTES = 4 * 1024**3  # ~4 GB heuristic ceiling
+
+def _validate_scaling_factor(scaling_factor: float) -> float:
+    if scaling_factor <= 0:
+        raise ValueError("scaling_factor must be positive.")
+    return float(scaling_factor)
+
 
 # A: Univariate (column-by-column)
 # ----------------------------------
@@ -15,6 +28,7 @@ def kolmogorov_smirnov_test(
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
     max_samples: int = 30_000,
     random_state: int = 42,
+    scaling_factor: float = 1.0,
 ) -> dict:
     """Calculate the two-sample Kolmogorov-Smirnov (KS) test column-wise
 
@@ -23,9 +37,14 @@ def kolmogorov_smirnov_test(
     Returns a dictionary mapping each column to its KS statistic (0.0 to 1.0),
     which represents the maximum vertical distance between the empirical CDFs.
     """
+    sf = _validate_scaling_factor(scaling_factor)
+    # Cap at 5M samples (~40 MB per float64 array) to stay well under 4 GB
+    effective_max_samples = min(int(round(max_samples * sf)), 5_000_000)
+    effective_max_samples = max(effective_max_samples, 1)
+
     results = {}
     rng = np.random.default_rng(random_state)
-    
+
     for col in columns:
         if col not in df_p.columns or col not in df_q.columns:
             continue
@@ -36,10 +55,10 @@ def kolmogorov_smirnov_test(
         if len(p_vals) == 0 or len(q_vals) == 0:
             continue
 
-        if len(p_vals) > max_samples:
-            p_vals = rng.choice(p_vals, max_samples, replace=False)
-        if len(q_vals) > max_samples:
-            q_vals = rng.choice(q_vals, max_samples, replace=False)
+        if len(p_vals) > effective_max_samples:
+            p_vals = rng.choice(p_vals, effective_max_samples, replace=False)
+        if len(q_vals) > effective_max_samples:
+            q_vals = rng.choice(q_vals, effective_max_samples, replace=False)
 
         # ks_2samp returns a result object containing .statistic and .pvalue
         ks_result = ks_2samp(p_vals, q_vals)
@@ -49,38 +68,45 @@ def kolmogorov_smirnov_test(
 
     return results
 
+
 def wasserstein(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
     max_samples: int = 15_000,
     random_state: int = 42,
+    scaling_factor: float = 1.0,
 ) -> dict:
     """
     Calculate the Wasserstein distance column-wise for the input dataframes.
     Returns a number between 0 (closest distance) and +inf per column, which scales with and has the unit of the input values.
     """
+    sf = _validate_scaling_factor(scaling_factor)
+    effective_max_samples = min(int(round(max_samples * sf)), 5_000_000)
+    effective_max_samples = max(effective_max_samples, 1)
+
     results = {}
     rng = np.random.default_rng(random_state)
-    
+
     for col in columns:
         if col not in df_p.columns or col not in df_q.columns:
             continue
-            
+
         p_vals = df_p[col].dropna().to_numpy()
         q_vals = df_q[col].dropna().to_numpy()
 
         if len(p_vals) == 0 or len(q_vals) == 0:
             continue
 
-        if len(p_vals) > max_samples:
-            p_vals = rng.choice(p_vals, max_samples, replace=False)
-        if len(q_vals) > max_samples:
-            q_vals = rng.choice(q_vals, max_samples, replace=False)
+        if len(p_vals) > effective_max_samples:
+            p_vals = rng.choice(p_vals, effective_max_samples, replace=False)
+        if len(q_vals) > effective_max_samples:
+            q_vals = rng.choice(q_vals, effective_max_samples, replace=False)
 
         # Works directly on raw data (no binning needed)
         results[col] = float(wasserstein_distance(p_vals, q_vals))
     return results
+
 
 def population_stability_index(
     df_p: pd.DataFrame,
@@ -88,6 +114,7 @@ def population_stability_index(
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
     num_bins: int = 50,
     eps: float = 1e-10,
+    scaling_factor: float = 1.0,
 ) -> dict:
     """Calculate the Population Stability Index (PSI) column-wise
 
@@ -99,6 +126,10 @@ def population_stability_index(
 - 0.10 <= PSI < 0.25: Moderate shift
 - PSI >= 0.25: Significant shift / instability
     """
+    sf = _validate_scaling_factor(scaling_factor)
+    effective_bins = min(int(round(num_bins * sf)), 10_000)
+    effective_bins = max(effective_bins, 1)
+
     results = {}
     for col in columns:
         if col not in df_p.columns or col not in df_q.columns:
@@ -111,7 +142,7 @@ def population_stability_index(
             continue
 
         # Define bin edges based on the baseline dataframe (df_p) using quantiles
-        quantiles = np.linspace(0, 100, num_bins + 1)
+        quantiles = np.linspace(0, 100, effective_bins + 1)
         bin_edges = np.percentile(p_vals, quantiles)
 
         # Handle edge cases where duplicate bin edges occur (e.g., sparse features)
@@ -147,6 +178,7 @@ def population_stability_index(
 
     return results
 
+
 def _kl_div_or_js_dist(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
@@ -154,6 +186,7 @@ def _kl_div_or_js_dist(
     bins: int = 50,
     epsilon: float = 1e-10,
     metric: str = "",
+    scaling_factor: float = 1.0,
 ) -> dict:
     """Calculates column-wise divergence or distance between two pandas DataFrames P and Q.
     Using default natural logarithm (base = e).
@@ -166,11 +199,16 @@ def _kl_div_or_js_dist(
 - bins: Number of bins for continuous numerical columns
 - epsilon: Smoothing factor to prevent zero-probability errors
 - metric: "kl" for asymmetric Kullback-Leibler Divergence (P || Q), "js" for symmetric Jensen-Shannon Distance
+- scaling_factor: Multiplier for computational effort
 
     Returns
     -----
 - dict of divergence/distance values for demanded columns.
     """
+    sf = _validate_scaling_factor(scaling_factor)
+    effective_bins = min(int(round(bins * sf)), 10_000)
+    effective_bins = max(effective_bins, 1)
+
     results = {}
 
     for col in columns:
@@ -191,7 +229,7 @@ def _kl_div_or_js_dist(
             results[col] = 0.0
             continue
 
-        bin_edges = np.linspace(min_val, max_val, bins + 1)
+        bin_edges = np.linspace(min_val, max_val, effective_bins + 1)
         p_counts, _ = np.histogram(p_data, bins=bin_edges)
         q_counts, _ = np.histogram(q_data, bins=bin_edges)
 
@@ -214,12 +252,14 @@ def _kl_div_or_js_dist(
 
     return results
 
+
 def kl_divergence(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
     bins: int = 50,
     epsilon: float = 1e-10,
+    scaling_factor: float = 1.0,
 ) -> dict:
     """Calculates the asymmetric Kullback-Leibler Divergence (P || Q) column-wise between two pandas DataFrames P and Q.
     Returns a Value between 0 (least divergence) and +inf, per column.
@@ -231,12 +271,22 @@ def kl_divergence(
 - columns: which columns to evaluate
 - bins: Number of bins for continuous numerical columns
 - epsilon: Smoothing factor to prevent zero-probability errors
+- scaling_factor: Multiplier for computational effort
 
     Returns
     -----
 - dict of divergence values for demanded columns.
     """
-    return _kl_div_or_js_dist(df_p=df_p, df_q=df_q, columns=columns, bins=bins, epsilon=epsilon, metric="kl")
+    return _kl_div_or_js_dist(
+        df_p=df_p,
+        df_q=df_q,
+        columns=columns,
+        bins=bins,
+        epsilon=epsilon,
+        metric="kl",
+        scaling_factor=scaling_factor,
+    )
+
 
 def js_distance(
     df_p: pd.DataFrame,
@@ -244,6 +294,7 @@ def js_distance(
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
     bins: int = 50,
     epsilon: float = 1e-10,
+    scaling_factor: float = 1.0,
 ) -> dict:
     """Calculates the symmetric Jensen-Shannon Distance column-wise between two pandas DataFrames P and Q.
     Returns a value between 0 (closest distance) and 0.832 = sqrt(ln 2), per column. 
@@ -255,13 +306,21 @@ def js_distance(
 - columns: which columns to evaluate
 - bins: Number of bins for continuous numerical columns
 - epsilon: Smoothing factor to prevent zero-probability errors
+- scaling_factor: Multiplier for computational effort
 
     Returns
     -----
 - dict of distance values for demanded columns.
     """
-
-    return _kl_div_or_js_dist(df_p=df_p, df_q=df_q, columns=columns, bins=bins, epsilon=epsilon, metric="js")
+    return _kl_div_or_js_dist(
+        df_p=df_p,
+        df_q=df_q,
+        columns=columns,
+        bins=bins,
+        epsilon=epsilon,
+        metric="js",
+        scaling_factor=scaling_factor,
+    )
 
 
 # B: Multivariate (columns combined)
@@ -273,6 +332,7 @@ def energy_distance(
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
     max_samples: int = 5_000,
     random_state: int = 42,
+    scaling_factor: float = 1.0,
 ) -> float:
     """Calculate the multivariate Energy Distance between two dataframes.
     
@@ -284,38 +344,49 @@ def energy_distance(
     
     Returns an energy distance value >= 0.0 (0 means identical distributions).
     """
+    sf = _validate_scaling_factor(scaling_factor)
     valid_cols = [c for c in columns if c in df_p.columns and c in df_q.columns]
     if not valid_cols:
         raise ValueError("No matching columns found in both DataFrames.")
-        
+
+    # Runtime is ~O(N^2), so scale N by sqrt(scaling_factor).
+    # Peak pairwise matrix memory is ~3 * N^2 * 8 bytes (dist_XY, dist_XX, dist_YY).
+    max_n_by_mem = int(np.sqrt(MAX_MEMORY_BYTES / (3 * 8)))
+    effective_max_samples = min(
+        int(round(max_samples * np.sqrt(sf))),
+        max_n_by_mem,
+    )
+    effective_max_samples = max(effective_max_samples, 1)
+
     rng = np.random.default_rng(random_state)
-    
+
     # CRASH FIX: Extract numpy arrays directly via random row indices (avoids pandas memory overhead)
-    p_indices = rng.choice(len(df_p), size=min(len(df_p), max_samples), replace=False)
-    q_indices = rng.choice(len(df_q), size=min(len(df_q), max_samples), replace=False)
-    
+    p_indices = rng.choice(len(df_p), size=min(len(df_p), effective_max_samples), replace=False)
+    q_indices = rng.choice(len(df_q), size=min(len(df_q), effective_max_samples), replace=False)
+
     X = df_p.iloc[p_indices][valid_cols].to_numpy(dtype=np.float64)
     Y = df_q.iloc[q_indices][valid_cols].to_numpy(dtype=np.float64)
-        
+
     n = len(X)
     m = len(Y)
     if n == 0 or m == 0:
         raise ValueError("One or both DataFrames are empty for selected columns.")
-        
+
     XX_sq = np.sum(X**2, axis=1, keepdims=True)
     YY_sq = np.sum(Y**2, axis=1, keepdims=True)
-    
+
     dist_XY = np.sqrt(np.clip(XX_sq + YY_sq.T - 2 * np.dot(X, Y.T), 0, None))
     dist_XX = np.sqrt(np.clip(XX_sq + XX_sq.T - 2 * np.dot(X, X.T), 0, None))
     dist_YY = np.sqrt(np.clip(YY_sq + YY_sq.T - 2 * np.dot(Y, Y.T), 0, None))
-    
+
     term_xy = np.sum(dist_XY) / (n * m)
     term_xx = np.sum(dist_XX) / (n * n)
     term_yy = np.sum(dist_YY) / (m * m)
-    
+
     energy_dist_sq = 2.0 * term_xy - term_xx - term_yy
-    
+
     return float(np.sqrt(np.maximum(0.0, energy_dist_sq)))
+
 
 def maximum_mean_discrepancy(
     df_p: pd.DataFrame,
@@ -323,6 +394,7 @@ def maximum_mean_discrepancy(
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
     max_samples: int = 2_000,
     random_state: int = 42,
+    scaling_factor: float = 1.0,
 ) -> float:
     """Calculate the multivariate Maximum Mean Discrepancy (MMD)
 
@@ -333,14 +405,24 @@ def maximum_mean_discrepancy(
 
     Returns a squared MMD value >= 0.0 (0 means identical distributions).
     """
+    sf = _validate_scaling_factor(scaling_factor)
     valid_cols = [c for c in columns if c in df_p.columns and c in df_q.columns]
     if not valid_cols:
         raise ValueError("No matching columns found in both DataFrames.")
 
+    # Runtime is ~O(N^2), so scale N by sqrt(scaling_factor).
+    # XY_pool has up to 2N rows -> dist_sq_pool is (2N) x (2N) * 8 bytes (~32 * N^2 bytes).
+    max_n_by_mem = int(np.sqrt(MAX_MEMORY_BYTES / (32 * 8)))
+    effective_max_samples = min(
+        int(round(max_samples * np.sqrt(sf))),
+        max_n_by_mem,
+    )
+    effective_max_samples = max(effective_max_samples, 1)
+
     rng = np.random.default_rng(random_state)
-    
-    p_indices = rng.choice(len(df_p), size=min(len(df_p), max_samples), replace=False)
-    q_indices = rng.choice(len(df_q), size=min(len(df_q), max_samples), replace=False)
+
+    p_indices = rng.choice(len(df_p), size=min(len(df_p), effective_max_samples), replace=False)
+    q_indices = rng.choice(len(df_q), size=min(len(df_q), effective_max_samples), replace=False)
 
     X = df_p.iloc[p_indices][valid_cols].to_numpy(dtype=np.float64)
     Y = df_q.iloc[q_indices][valid_cols].to_numpy(dtype=np.float64)
@@ -379,36 +461,52 @@ def maximum_mean_discrepancy(
 
     return float(np.maximum(0.0, mmd_sq))
 
+
 def c2st(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
     max_samples: int = 10_000,
     random_state: int = 42,
+    scaling_factor: float = 1.0,
 ) -> float:
     """Make a multivariate Classifier-Two-Sample-Test (C2ST) across all specified columns.
     
     Returns a single number between 0.5 (minimally distinct data) and 1.0 (maximally distinct data).
     """
+    sf = _validate_scaling_factor(scaling_factor)
     cols = [c for c in columns if c in df_p.columns and c in df_q.columns]
     if not cols:
         raise ValueError("No matching columns found.")
-        
+
+    # Scale forest size linearly and samples sublinearly, capped under ~4 GB
+    n_estimators = min(max(int(round(20 * sf)), 1), 1_000)
+    max_n_by_mem = int(MAX_MEMORY_BYTES / (max(len(cols), 1) * 8 * 4))
+    effective_max_samples = min(
+        int(round(max_samples * np.sqrt(sf))),
+        max_n_by_mem,
+        2_000_000,
+    )
+    effective_max_samples = max(effective_max_samples, 1)
+
     rng = np.random.default_rng(random_state)
-    
-    p_indices = rng.choice(len(df_p), size=min(len(df_p), max_samples), replace=False)
-    q_indices = rng.choice(len(df_q), size=min(len(df_q), max_samples), replace=False)
-    
+
+    p_indices = rng.choice(len(df_p), size=min(len(df_p), effective_max_samples), replace=False)
+    q_indices = rng.choice(len(df_q), size=min(len(df_q), effective_max_samples), replace=False)
+
     p_subset = df_p.iloc[p_indices][cols]
     q_subset = df_q.iloc[q_indices][cols]
-    
+
     X = pd.concat([p_subset, q_subset], axis=0)
     y = np.array([0] * len(p_subset) + [1] * len(q_subset))
-    
-    clf = RandomForestClassifier(n_estimators=20, max_depth=8, n_jobs=-1, random_state=random_state)
+
+    clf = RandomForestClassifier(
+        n_estimators=n_estimators, max_depth=8, n_jobs=-1, random_state=random_state
+    )
     scores = cross_val_score(clf, X, y, cv=5, scoring="accuracy")
-    
+
     return float(scores.mean())
+
 
 # C: Combinations
 # ---------------
@@ -417,6 +515,7 @@ def evaluate_univariate_metrics(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
+    scaling_factor: float = 1.0,
     verbose: bool = True,
 ) -> dict:
     """Run all univariate column-wise metrics safely with error handling."""
@@ -426,11 +525,11 @@ def evaluate_univariate_metrics(
     results = {}
     
     metrics_to_run = {
-        "kolmogorov_smirnov": lambda: kolmogorov_smirnov_test(df_p=df_p, df_q=df_q, columns=columns),
-        "wasserstein": lambda: wasserstein(df_p=df_p, df_q=df_q, columns=columns),
-        "psi": lambda: population_stability_index(df_p=df_p, df_q=df_q, columns=columns),
-        "kl_divergence": lambda: kl_divergence(df_p=df_p, df_q=df_q, columns=columns),
-        "js_distance": lambda: js_distance(df_p=df_p, df_q=df_q, columns=columns),
+        "kolmogorov_smirnov": lambda: kolmogorov_smirnov_test(df_p=df_p, df_q=df_q, columns=columns, scaling_factor=scaling_factor),
+        "wasserstein": lambda: wasserstein(df_p=df_p, df_q=df_q, columns=columns, scaling_factor=scaling_factor),
+        "psi": lambda: population_stability_index(df_p=df_p, df_q=df_q, columns=columns, scaling_factor=scaling_factor),
+        "kl_divergence": lambda: kl_divergence(df_p=df_p, df_q=df_q, columns=columns, scaling_factor=scaling_factor),
+        "js_distance": lambda: js_distance(df_p=df_p, df_q=df_q, columns=columns, scaling_factor=scaling_factor),
     }
 
     for name, func in metrics_to_run.items():
@@ -445,10 +544,12 @@ def evaluate_univariate_metrics(
 
     return results
 
+
 def evaluate_multivariate_metrics(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
+    scaling_factor: float = 1.0,
     verbose: bool = True,
 ) -> dict:
     """Run all multivariate joint distribution metrics safely with error handling."""
@@ -458,9 +559,9 @@ def evaluate_multivariate_metrics(
     results = {}
     
     metrics_to_run = {
-        "energy_distance": lambda: energy_distance(df_p=df_p, df_q=df_q, columns=columns),
-        "mmd": lambda: maximum_mean_discrepancy(df_p=df_p, df_q=df_q, columns=columns),
-        "c2st": lambda: c2st(df_p=df_p, df_q=df_q, columns=columns),
+        "energy_distance": lambda: energy_distance(df_p=df_p, df_q=df_q, columns=columns, scaling_factor=scaling_factor),
+        "mmd": lambda: maximum_mean_discrepancy(df_p=df_p, df_q=df_q, columns=columns, scaling_factor=scaling_factor),
+        "c2st": lambda: c2st(df_p=df_p, df_q=df_q, columns=columns, scaling_factor=scaling_factor),
     }
 
     for name, func in metrics_to_run.items():
@@ -474,20 +575,26 @@ def evaluate_multivariate_metrics(
 
     return results
 
+
 def evaluate_all_metrics(
     df_p: pd.DataFrame,
     df_q: pd.DataFrame,
     columns: set = {"ekin", "x", "y", "z", "ux", "uy", "uz"},
+    scaling_factor: float = 1.0,
     verbose: bool = True,
 ) -> dict:
-    """Master wrapper that safely evaluates both univariate and multivariate suites."""
+    """Master wrapper that safely evaluates both univariate and multivariate suites.
+    Set scaling factor to a value larger than 1 to increase the amount/difficulty of computation.
+    """
+    
     if verbose:
         print("Starting evaluation of all univariate and multivariate metrics...")
     
     return {
-        "univariate": evaluate_univariate_metrics(df_p=df_p, df_q=df_q, columns=columns, verbose=verbose),
-        "multivariate": evaluate_multivariate_metrics(df_p=df_p, df_q=df_q, columns=columns, verbose=verbose),
+        "univariate": evaluate_univariate_metrics(df_p=df_p, df_q=df_q, columns=columns, scaling_factor=scaling_factor, verbose=verbose),
+        "multivariate": evaluate_multivariate_metrics(df_p=df_p, df_q=df_q, columns=columns, scaling_factor=scaling_factor, verbose=verbose),
     }
+
 
 # OTHER
 # -----
